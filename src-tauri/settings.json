@@ -1,0 +1,12 @@
+{
+  "source_language": "auto",
+  "target_language": "zh",
+  "batch_size": 16,
+  "batch_length": 30,
+  "inference_device": "cuda",
+  "compute_type": "float32",
+  "max_segment_length": 80,
+  "vad_enabled": true,
+  "vocal_isolation_enabled": true,
+  "custom_glossary_path": ""
+}

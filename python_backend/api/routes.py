@@ -1,0 +1,341 @@
+import asyncio
+import json
+from pydantic import BaseModel
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from models.schemas import TranscribeRequest, TranslateTextRequest
+from services.asr_service import asr_service
+from services.model_manager import model_manager
+from services.system_monitor import system_monitor
+from services.translation_service import translation_service
+
+router = APIRouter()
+
+# Store active websocket connections
+active_connections = {}
+
+@router.get("/health")
+async def health_check():
+    return {"status": "AISubPlayer active", "version": "1.0.0"}
+
+@router.websocket("/ws/transcribe/{video_id}")
+async def websocket_endpoint(websocket: WebSocket, video_id: str):
+    """
+    处理实时的字幕生成推流
+    """
+    await websocket.accept()
+    active_connections[video_id] = websocket
+    
+    try:
+        # 等待前端发送配置请求
+        data = await websocket.receive_text()
+        request_data = json.loads(data)
+        req = TranscribeRequest(**request_data)
+        
+        # TODO: 验证模型是否就绪，若无则通知前端开始下载
+        
+        # 通知前端已经建连
+        await websocket.send_text(json.dumps({
+            "type": "progress",
+            "message": "正在分配设备资源..."
+        }))
+        
+        # 使用 asyncio.to_thread 防止阻塞 WebSocket 事件循环
+        loop = asyncio.get_event_loop()
+        
+        # 为了让 transcribe_video 能发送状态回 websocket，我们传入一个 callback
+        def progress_callback(msg):
+            # to_thread 里我们不能直接 await send_text，可以通过 event loop thread-safe 发送
+            asyncio.run_coroutine_threadsafe(
+                websocket.send_text(json.dumps({
+                    "type": "progress",
+                    "message": msg
+                })),
+                loop
+            )
+
+        # 真正调用 Faster Whisper 翻译
+        def generate_subtitles():
+            for segment in asr_service.transcribe_video(req, on_progress=progress_callback):
+                yield segment
+
+        generator = generate_subtitles()
+        
+        while True:
+            try:
+                # 在单独的线程中获取下一个片段避免阻塞主事件循环
+                segment = await loop.run_in_executor(None, next, generator)
+                await websocket.send_text(json.dumps({
+                    "type": "subtitle_chunk", 
+                    "data": segment.model_dump()
+                }))
+            except StopIteration:
+                break
+            except Exception as e:
+                print(f"Transcription error: {e}")
+                await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+                break
+        
+        await websocket.send_text(json.dumps({"type": "transcribe_done"}))
+            
+    except WebSocketDisconnect:
+        # 前端主动断开 / 中止任务
+        print(f"Client disconnected for video {video_id}")
+    finally:
+        if video_id in active_connections:
+            del active_connections[video_id]
+
+@router.get("/models")
+async def get_models():
+    """获取本地和在线可用模型列表"""
+    local = model_manager.list_local_models()
+    return {
+        "local_models": local,
+        "download_status": model_manager.download_status,
+        "supported_models": ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
+    }
+
+@router.get("/models/status")
+async def get_models_status():
+    """前端轮询端点：获取本地模型列表和当前下载状态"""
+    import os
+    local = model_manager.list_local_models()
+    engine_dir = os.path.join(model_manager.models_dir, 'cuda_engine')
+    has_cuda_engine = os.path.exists(os.path.join(engine_dir, '.completed'))
+    
+    return {
+        "local_models": local,
+        "download_status": model_manager.download_status,
+        "cuda_engine_ready": has_cuda_engine
+    }
+
+class ModelActionRequest(BaseModel):
+    model_id: str
+
+@router.post("/models/download")
+async def api_download_model(req: ModelActionRequest):
+    model_manager.download_model(req.model_id)
+    return {"status": "started"}
+
+@router.post("/models/pause")
+async def api_pause_download(req: ModelActionRequest):
+    model_manager.pause_download(req.model_id)
+    return {"status": "paused"}
+
+@router.post("/models/delete")
+async def api_delete_model(req: ModelActionRequest):
+    model_manager.delete_model(req.model_id)
+    return {"status": "deleted"}
+
+@router.post("/models/open_folder")
+async def open_model_folder():
+    model_manager.open_model_folder()
+    return {"status": "ok"}
+
+@router.post("/models/cuda/download")
+async def api_download_cuda():
+    model_manager.download_cuda_engine()
+    return {"status": "started"}
+
+@router.post("/models/cuda/pause")
+async def api_pause_cuda():
+    model_manager.pause_cuda_engine()
+    return {"status": "paused"}
+
+@router.post("/models/test_connection")
+async def test_model_connection(req: ModelActionRequest):
+    """测试与 HuggingFace 镜像的连接状态"""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, model_manager.test_connection, req.model_id)
+    return result
+
+def _isolated_run_test(queue, model_id, inference_device, compute_type, source_language):
+    try:
+        import numpy as np
+        import traceback
+        # 必须在子进程中重新导入以避免 pickling 错误和上下文冲突
+        from services.asr_service import asr_service
+        
+        # 重新初始化并加载所需环境和模型
+        model = asr_service.load_model(model_id, inference_device, compute_type)
+        audio_data = np.zeros(16000, dtype=np.float32)
+        lang = source_language if source_language != "auto" else "zh"
+        
+        # 触发前向空跑推理并等待结果
+        segments, info = model.transcribe(audio_data, language=lang)
+        list(segments)
+        queue.put({"status": "success"})
+    except Exception as e:
+        import traceback
+        queue.put({"status": "error", "message": f"{str(e)}\n{traceback.format_exc()}"})
+
+@router.post("/test_inference")
+async def api_test_inference(req: TranscribeRequest):
+    import asyncio
+    import multiprocessing
+    import traceback
+
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        queue = ctx.Queue()
+        
+        p = ctx.Process(
+            target=_isolated_run_test,
+            args=(queue, req.model_id, req.inference_device, req.compute_type, req.source_language),
+            daemon=True
+        )
+        p.start()
+
+        # 等待子进程结果，如果在限定时间内不返回则被认为是挂起
+        async def _wait_for_result():
+            while p.is_alive():
+                if not queue.empty():
+                    return queue.get()
+                await asyncio.sleep(0.5)
+            # 子进程退出但没有排队内容
+            if not queue.empty():
+                return queue.get()
+            return {"status": "error", "message": "子进程已意外结束，但未返回任何状态。"}
+
+        try:
+            # 15秒超时设置，避免主进程假死
+            result = await asyncio.wait_for(_wait_for_result(), timeout=15.0)
+            if result.get("status") == "success":
+                return {
+                    "status": "success", 
+                    "message": f"引擎自检通过 ✓ (Device: {req.inference_device}, Compute: {req.compute_type})"
+                }
+            else:
+                return {
+                    "status": "error", 
+                    "message": f"推理引擎挂载失败:\n{result.get('message')}"
+                }
+        except asyncio.TimeoutError:
+            # 卡死说明库本身或设备不兼容导致彻底锁住(死锁)。此时只能结束进程。
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=1.0)
+                if p.is_alive():
+                    p.kill()
+
+            return {
+                "status": "error", 
+                "message": (
+                    f"⚠️ 推理引擎超时卡死 (已强制终止)。\n\n"
+                    f"可能原因：在您当前的 GPU 或驱动上，不支持目前的计算精度（例：不支持 '{req.compute_type}' 或缺少特定 DLL 核心库）。\n"
+                    f"建议操作：\n1. 将 Compute Type (计算精度) 切换为 'float32' 并重试。\n2. 检查您的 NVIDIA 显卡驱动是否需要更新。"
+                )
+            }
+            
+    except Exception as e:
+        return {
+            "status": "error", 
+            "message": f"启动自检进程失败: {str(e)}\n{traceback.format_exc()}"
+        }
+
+# 已知的下载源列表
+DOWNLOAD_SOURCES = [
+    {"id": "hf-mirror", "name": "HF Mirror", "desc": "中国大陆推荐", "endpoint": "https://hf-mirror.com"},
+    {"id": "aliendao", "name": "AlienDAO", "desc": "备用镜像", "endpoint": "https://aliendao.cn"},
+    {"id": "huggingface", "name": "HuggingFace 官方", "desc": "海外用户", "endpoint": "https://huggingface.co"},
+]
+
+@router.get("/models/sources")
+async def get_download_sources():
+    """获取可用下载源列表及当前选中源"""
+    import os
+    return {
+        "sources": DOWNLOAD_SOURCES,
+        "current": os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"),
+    }
+
+@router.post("/models/test_sources")
+async def test_all_sources():
+    """并发测试所有下载源的连通性，返回各源延迟"""
+    import asyncio, socket, time
+
+    def test_one(endpoint: str) -> dict:
+        host = endpoint.replace("https://", "").replace("http://", "").split("/")[0]
+        start = time.time()
+        try:
+            conn = socket.create_connection((host, 443), timeout=6)
+            conn.close()
+            latency = int((time.time() - start) * 1000)
+            return {"ok": True, "latency_ms": latency}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:60]}
+
+    loop = asyncio.get_event_loop()
+    tasks = [
+        loop.run_in_executor(None, test_one, src["endpoint"])
+        for src in DOWNLOAD_SOURCES
+    ]
+    results = await asyncio.gather(*tasks)
+    return {
+        "results": [
+            {**src, **result}
+            for src, result in zip(DOWNLOAD_SOURCES, results)
+        ]
+    }
+
+class SetSourceRequest(BaseModel):
+    endpoint: str
+
+@router.post("/models/set_source")
+async def set_download_source(req: SetSourceRequest):
+    """切换下载源（运行时动态修改 HF_ENDPOINT）"""
+    import os
+    os.environ["HF_ENDPOINT"] = req.endpoint
+    import huggingface_hub.constants as hf_consts
+    hf_consts.ENDPOINT = req.endpoint
+    model_manager.HF_ENDPOINT = req.endpoint
+    return {"ok": True, "endpoint": req.endpoint}
+
+
+
+@router.get("/system/stats")
+async def get_system_stats():
+    """获取底层系统监控数据"""
+    return system_monitor.get_system_stats()
+
+@router.post("/translate")
+async def translate_text(req: TranslateTextRequest):
+    """独立的直接翻译文本通道"""
+    result = translation_service.translate_segment(req.text, req.source_language, req.target_language)
+    return {"text": result}
+
+def get_settings_path():
+    import os
+    base_dir = os.path.expanduser("~/.aisubplayer")
+    os.makedirs(base_dir, exist_ok=True)
+    return os.path.join(base_dir, "settings.json")
+
+@router.post("/settings/save")
+async def save_settings(req: dict):
+    import os
+    try:
+        path = get_settings_path()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(req, f, ensure_ascii=False, indent=2)
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@router.get("/settings/load")
+async def load_settings():
+    import os
+    path = get_settings_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+@router.post("/shutdown")
+async def shutdown_backend():
+    """安全退出后端进程"""
+    import os
+    os._exit(0)
+    return {"status": "shutting down"}

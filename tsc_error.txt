@@ -1,0 +1,8 @@
+﻿src/components/SettingsModal.tsx(259,18): error TS18046: 'store' is of type 'unknown'.
+src/components/SettingsModal.tsx(259,44): error TS7006: Parameter 'model' implicitly has an 'any' type.
+src/components/SettingsModal.tsx(262,110): error TS18046: 'store' is of type 'unknown'.
+src/components/SettingsModal.tsx(270,34): error TS18046: 'store' is of type 'unknown'.
+src/components/SettingsModal.tsx(293,56): error TS18046: 'store' is of type 'unknown'.
+src/components/SettingsModal.tsx(299,38): error TS18046: 'store' is of type 'unknown'.
+src/components/SettingsModal.tsx(301,60): error TS18046: 'store' is of type 'unknown'.
+src/components/SettingsModal.tsx(310,52): error TS18046: 'store' is of type 'unknown'.
