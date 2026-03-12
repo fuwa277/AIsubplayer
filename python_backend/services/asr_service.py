@@ -52,7 +52,7 @@ class ASRService:
             
             if on_progress:
                 device_name = "GPU (CUDA)" if actual_device == "cuda" else "CPU"
-                on_progress(f"正在配置并在 {device_name} 上加载 AI 模型 (该过程可能需要较长时间)...")
+                on_progress(f"正在配置并在 {device_name} 上加载 AI 模型 (首次加载/切换模型需1-3分钟编译，请耐心等待)...")
 
             self.current_model = WhisperModel(
                 model_source,
@@ -83,7 +83,22 @@ class ASRService:
                 on_progress("正在抽取视频的音轨...")
             audio_path = audio_extractor.extract_audio(request.video_path)
             
-            # 步骤 2: Optional 人声分离及更严苛的 VAD 可以安插在此刻处理 audio_path 
+            # --- 断点续传：跳过已经识别过的音频 ---
+            if request.resume_offset > 0:
+                if on_progress:
+                    on_progress(f"检测到断点，正在跳过前 {request.resume_offset:.1f} 秒音频...")
+                import tempfile
+                import subprocess
+                import os
+                sliced_audio = os.path.join(tempfile.gettempdir(), f"sliced_resume_{os.path.basename(audio_path)}")
+                try:
+                    subprocess.run(["ffmpeg", "-y", "-i", audio_path, "-ss", str(request.resume_offset), "-c", "copy", sliced_audio], check=True, capture_output=True)
+                    audio_extractor.cleanup(audio_path)
+                    audio_path = sliced_audio
+                except Exception as e:
+                    print(f"Resume slice failed: {e}")
+            
+            # 步骤 2: Optional 人声分离及更严苛的 VAD 可以安插在此刻处理 audio_path
             
             # 读取词典配置 (放入 Initial Prompt 引导 Whisper 发音/术语纠正)
             initial_prompt = None
@@ -101,7 +116,7 @@ class ASRService:
             # 步骤 3: 喂给 faster-whisper 执行转录
             print(f"Starting actual transcription on audio trace, using glossary: {bool(initial_prompt)}")
             if on_progress:
-                on_progress("模型分析中...")
+                on_progress("音频提取完毕，模型开始正式推理生成字幕...")
             
             segments, info = model.transcribe(
                 audio_path,
@@ -127,12 +142,12 @@ class ASRService:
                         if request.remove_punctuation:
                             wt = wt.translate(str.maketrans('', '', string.punctuation + '，、。！？；：（）《》【】“”‘’'))
                         if wt:
-                            words.append(WordTimestamp(start=w.start, end=w.end, word=wt))
+                            words.append(WordTimestamp(start=w.start + request.resume_offset, end=w.end + request.resume_offset, word=wt))
                             
                 yield SubtitleSegment(
                     id=_id,
-                    start_time=segment.start,
-                    end_time=segment.end,
+                    start_time=segment.start + request.resume_offset,
+                    end_time=segment.end + request.resume_offset,
                     text=text,
                     original_text=None,
                     words=words if request.word_timestamps else None

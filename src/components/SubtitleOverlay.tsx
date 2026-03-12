@@ -41,7 +41,7 @@ export const SubtitleOverlay: React.FC = () => {
                         {/* Main translation text */}
                         <p
                             style={{
-                                fontSize: `${style.fontSize}px`,
+                                fontSize: `max(${style.fontSize}px, ${style.fontSize / 30}vw)`,
                                 color: style.fontColor,
                                 fontWeight: style.fontWeight,
                                 lineHeight: 1.5,
@@ -54,7 +54,7 @@ export const SubtitleOverlay: React.FC = () => {
                         {style.showBilingual && currentCue.originalText && (
                             <p
                                 style={{
-                                    fontSize: `${style.originalFontSize}px`,
+                                    fontSize: `max(${style.originalFontSize}px, ${style.originalFontSize / 30}vw)`,
                                     color: style.originalFontColor,
                                     lineHeight: 1.4,
                                     marginTop: '4px',

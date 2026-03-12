@@ -14,6 +14,7 @@ export interface VideoItem {
     path: string; // 后端需要用的绝对物理路径
     webPath?: string; // 供 React <video> 加载的 asset:// 或者是 blob:// 路径
     duration: number;
+    currentTime?: number; // 记录播放进度
     thumbnail?: string;
     subtitleStatus: 'none' | 'pending' | 'generating' | 'done' | 'paused' | 'error';
     subtitleProgress: number; // 0-100
@@ -47,6 +48,8 @@ export interface QueueState {
     updateVideoSubtitleStatus: (videoId: string, status: VideoItem['subtitleStatus'], progress?: number, msg?: string) => void;
     addSubtitleToVideo: (videoId: string, subtitle: SubtitleTrack) => void;
     setActiveSubtitleId: (videoId: string, subtitleId: string | null) => void;
+    updateVideoDuration: (videoId: string, duration: number) => void;
+    updateVideoTime: (videoId: string, time: number) => void;
 }
 
 const DEFAULT_QUEUE: PlayQueue = {
@@ -60,7 +63,19 @@ function loadQueues(): { queues: PlayQueue[]; activeQueueId: string; activeVideo
     try {
         const stored = localStorage.getItem('aisubplayer-queues');
         if (stored) {
-            return JSON.parse(stored);
+            const parsed = JSON.parse(stored);
+            // 修复重启应用后，状态卡在 generating 导致无法读取本地字幕的问题
+            if (parsed.queues) {
+                parsed.queues.forEach((q: PlayQueue) => {
+                    q.items.forEach((v: VideoItem) => {
+                        if (v.subtitleStatus === 'generating' || v.subtitleStatus === 'pending') {
+                            v.subtitleStatus = 'paused';
+                            v.subtitleStatusMsg = '应用重启，已暂停';
+                        }
+                    });
+                });
+            }
+            return parsed;
         }
     } catch { }
     return { queues: [DEFAULT_QUEUE], activeQueueId: 'default', activeVideoIndex: 0 };
@@ -212,6 +227,26 @@ export const useQueueStore = create<QueueState>((set, get) => {
             const queues = s.queues.map(q => ({
                 ...q,
                 items: q.items.map(v => v.id === videoId ? { ...v, activeSubtitleId: subtitleId } : v),
+            }));
+            const next = { ...s, queues };
+            persistQueues(next);
+            return { queues };
+        }),
+
+        updateVideoDuration: (videoId, duration) => set((s) => {
+            const queues = s.queues.map(q => ({
+                ...q,
+                items: q.items.map(v => v.id === videoId ? { ...v, duration } : v)
+            }));
+            const next = { ...s, queues };
+            persistQueues(next);
+            return { queues };
+        }),
+
+        updateVideoTime: (videoId, time) => set((s) => {
+            const queues = s.queues.map(q => ({
+                ...q,
+                items: q.items.map(v => v.id === videoId ? { ...v, currentTime: time } : v)
             }));
             const next = { ...s, queues };
             persistQueues(next);

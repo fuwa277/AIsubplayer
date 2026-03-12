@@ -11,7 +11,7 @@ import { usePlayerStore } from "./stores/playerStore";
 import { useQueueStore, VideoItem } from "./stores/queueStore";
 import { useLogStore } from "./stores/logStore";
 import { listen } from '@tauri-apps/api/event';
-import { convertFileSrc } from '@tauri-apps/api/core';
+import { convertFileSrc } from "@tauri-apps/api/core";
 
 import { generateId } from "./utils";
 
@@ -43,20 +43,23 @@ function App() {
     document.body.style.backgroundColor = bgColor;
   }, [bgColor]);
 
-  // Handle global Tauri native file drag and drop
+  // Tauri V2 Native Drag & Drop (配合 dragDropEnabled: true)
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     const setupDragDrop = async () => {
       try {
-        unlisten = await listen<{ paths: string[] }>('tauri://drag-drop', (event) => {
-          const paths = event.payload.paths;
+        // Tauri V2 默认通过 tauri://drag-drop 派发带有物理路径的拖放事件
+        unlisten = await listen<any>('tauri://drag-drop', (event) => {
+          const payload = event.payload;
+          const paths = payload.paths || payload;
+          if (!paths || !Array.isArray(paths)) return;
+
           const state = useQueueStore.getState();
           const targetQueueId = state.activeQueueId || (state.queues.length > 0 ? state.queues[0].id : 'default');
           const activeQueue = state.queues.find(q => q.id === targetQueueId);
 
-          paths.forEach(async (p) => {
+          paths.forEach(async (p: string) => {
             const name = p.split(/[/\\]/).pop() || 'Unknown';
-            // Simple check for video extensions
             if (/\.(mp4|mkv|avi|mov|webm|flv|wmv)$/i.test(name)) {
               if (activeQueue) {
                 const existingIndex = activeQueue.items.findIndex(v => v.path === p);
@@ -66,27 +69,65 @@ function App() {
                 }
               }
 
+              const videoId = generateId();
+              const webPath = convertFileSrc(p);
               const video: VideoItem = {
-                id: generateId(),
+                id: videoId,
                 name: name.replace(/\.[^.]+$/, ''),
                 path: p,
-                webPath: convertFileSrc(p),
+                webPath: webPath,
                 duration: 0,
                 subtitleStatus: 'none',
                 subtitleProgress: 0,
               };
               state.addVideo(targetQueueId, video);
+              
+              const tempVid = document.createElement('video');
+              tempVid.preload = 'metadata';
+              tempVid.src = webPath;
+              tempVid.onloadedmetadata = () => {
+                 useQueueStore.getState().updateVideoDuration(videoId, tempVid.duration);
+              };
             }
           });
         });
       } catch (err) {
-        console.error("Failed to setup drag-drop listener:", err);
+        console.error("Drag-drop setup failed:", err);
       }
     };
     setupDragDrop();
-    return () => {
-      if (unlisten) unlisten();
-    };
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
+  // 监听播放列表切换，如果切回了记忆过的视频，自动空降到历史播放时间点
+  useEffect(() => {
+    return useQueueStore.subscribe((state, prevState) => {
+        const currentVideo = state.queues.find(q => q.id === state.activeQueueId)?.items[state.activeVideoIndex];
+        const prevVideo = prevState.queues.find(q => q.id === prevState.activeQueueId)?.items[prevState.activeVideoIndex];
+        
+        if (currentVideo?.id !== prevVideo?.id && currentVideo && videoRef.current) {
+            const handleLoaded = () => {
+                if (currentVideo.currentTime && videoRef.current) {
+                    videoRef.current.currentTime = currentVideo.currentTime;
+                }
+            };
+            videoRef.current.addEventListener('loadedmetadata', handleLoaded, { once: true });
+        }
+    });
+  }, []);
+
+  // 每 1 秒钟保存一次当前播放进度，实现按秒精准记忆
+  useEffect(() => {
+    const interval = setInterval(() => {
+       if (videoRef.current && !videoRef.current.paused) {
+           const state = useQueueStore.getState();
+           const activeVideo = state.getActiveVideo();
+           if (activeVideo && videoRef.current.currentTime > 0) {
+               state.updateVideoTime(activeVideo.id, videoRef.current.currentTime);
+           }
+       }
+    }, 1000);
+    return () => clearInterval(interval);
   }, []);
 
 

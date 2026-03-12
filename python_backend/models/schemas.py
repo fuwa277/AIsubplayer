@@ -29,6 +29,7 @@ class TranscribeRequest(BaseModel):
     max_segment_length: int = 40
     word_timestamps: bool = True
     remove_punctuation: bool = False
+    resume_offset: float = 0.0
 
 class TranslateTextRequest(BaseModel):
     text: str

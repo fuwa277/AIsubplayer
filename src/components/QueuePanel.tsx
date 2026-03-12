@@ -2,17 +2,17 @@ import React, { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
 import {
     Plus, Trash2, Play, Sparkles,
-    FolderPlus, FileText, ChevronDown, X
+    FolderPlus, FileText, ChevronDown, X, FolderOpen
 } from 'lucide-react';
 import { useQueueStore, VideoItem } from '../stores/queueStore';
 import { useSettingsStore } from '../stores/settingsStore';
 import { useSubtitleStore } from '../stores/subtitleStore';
-import { usePlayerStore } from '../stores/playerStore';
 import { formatTime, generateId } from '../utils';
 import { subtitleClient } from '../services/subtitleClient';
 import { useLogStore } from '../stores/logStore';
 import { open as tauriOpen } from '@tauri-apps/plugin-dialog';
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { revealItemInDir } from '@tauri-apps/plugin-opener';
 
 export const QueuePanel: React.FC = () => {
     const {
@@ -20,7 +20,6 @@ export const QueuePanel: React.FC = () => {
         addQueue, setActiveQueue,
         addVideo, removeVideo, setActiveVideoIndex
     } = useQueueStore();
-    const { setPlaying } = usePlayerStore();
 
     const [showNewQueueInput, setShowNewQueueInput] = useState(false);
     const [newQueueName, setNewQueueName] = useState('');
@@ -37,6 +36,8 @@ export const QueuePanel: React.FC = () => {
     const handleQueueContextMenu = (e: React.MouseEvent, queueId: string) => {
         e.preventDefault();
         e.stopPropagation();
+        // 派发事件关闭其他菜单（包括视频菜单）
+        document.dispatchEvent(new CustomEvent('close-video-menus'));
         setQueueCtx({ x: e.clientX, y: e.clientY, queueId });
     };
 
@@ -44,7 +45,11 @@ export const QueuePanel: React.FC = () => {
         const handleClickOutside = () => setQueueCtx(null);
         if (queueCtx) {
             window.addEventListener('click', handleClickOutside);
-            return () => window.removeEventListener('click', handleClickOutside);
+            document.addEventListener('close-video-menus', handleClickOutside);
+            return () => {
+                window.removeEventListener('click', handleClickOutside);
+                document.removeEventListener('close-video-menus', handleClickOutside);
+            };
         }
     }, [queueCtx]);
 
@@ -108,14 +113,28 @@ export const QueuePanel: React.FC = () => {
             // 跳过已完成的
             if (video.subtitleStatus === 'done') continue;
 
-            const fakeId = 'ai-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6);
-            store.addSubtitleToVideo(videoId, {
-                id: fakeId,
-                name: `AI 字幕 (${modelId})`,
-                type: 'ai',
-                modelId,
-            });
-            store.setActiveSubtitleId(videoId, fakeId);
+            // 查找是否已存在该模型的字幕轨
+            const existingTrack = video.subtitles?.find(s => s.type === 'ai' && s.modelId === modelId);
+            const trackId = existingTrack ? existingTrack.id : ('ai-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6));
+
+            if (!existingTrack) {
+                store.addSubtitleToVideo(videoId, {
+                    id: trackId,
+                    name: `AI 字幕 (${modelId})`,
+                    type: 'ai',
+                    modelId,
+                });
+            }
+            store.setActiveSubtitleId(videoId, trackId);
+
+            // 核心：计算断点续传时间
+            let resumeOffset = 0;
+            if (existingTrack && subStore.cues.length > 0) {
+                const lastCue = subStore.cues[subStore.cues.length - 1];
+                if (lastCue.id.toString().startsWith(trackId)) {
+                    resumeOffset = lastCue.endTime;
+                }
+            }
 
             // 确保后端就绪后再发起生成（后端启动慢时给用户提示而不是直接报错）
             const backendOk = await waitForBackend();
@@ -126,7 +145,7 @@ export const QueuePanel: React.FC = () => {
                 continue;
             }
 
-            subtitleClient.generate(videoId, video.path, fakeId);
+            subtitleClient.generate(videoId, video.path, trackId, resumeOffset);
 
             // 等待这个视频完成（done/error/paused）再处理下一个
             await new Promise<void>(resolve => {
@@ -203,24 +222,49 @@ export const QueuePanel: React.FC = () => {
                 paths.forEach(p => {
                     const name = p.split(/[/\\]/).pop() || 'Unknown';
 
-                    if (activeQueue) {
-                        const existingIndex = activeQueue.items.findIndex(v => v.path === p);
+                    // 修复闭包陷阱：每次循环时实时获取最新的 Store 状态，而不是用 useCallback 缓存的旧变量
+                    const currentStore = useQueueStore.getState();
+                    const currentActiveQueue = currentStore.queues.find(q => q.id === activeQueueId);
+
+                    if (currentActiveQueue) {
+                        const existingIndex = currentActiveQueue.items.findIndex(v => v.path === p);
                         if (existingIndex !== -1) {
-                            setActiveVideoIndex(existingIndex);
+                            currentStore.setActiveVideoIndex(existingIndex);
                             return;
                         }
                     }
 
+                    const videoId = generateId();
+                    const webPath = convertFileSrc(p);
                     const video: VideoItem = {
-                        id: generateId(),
+                        id: videoId,
                         name: name.replace(/\.[^.]+$/, ''),
                         path: p,
-                        webPath: convertFileSrc(p),
+                        webPath: webPath,
                         duration: 0,
                         subtitleStatus: 'none',
                         subtitleProgress: 0,
                     };
                     addVideo(activeQueueId, video);
+
+                    // 异步获取真实的视频时长以解决进度条一直是 0% 的问题
+                    const tempVid = document.createElement('video');
+                    tempVid.preload = 'metadata';
+                    tempVid.src = webPath;
+                    tempVid.onloadedmetadata = () => {
+                        const store = useQueueStore.getState();
+                        const targetQueue = store.queues.find(q => q.id === activeQueueId);
+                        if (targetQueue) {
+                            const vIndex = targetQueue.items.findIndex(v => v.id === videoId);
+                            if (vIndex !== -1) {
+                                const newQueues = store.queues.map(q => q.id === activeQueueId ? {
+                                    ...q,
+                                    items: q.items.map(v => v.id === videoId ? { ...v, duration: tempVid.duration } : v)
+                                } : q);
+                                useQueueStore.setState({ queues: newQueues });
+                            }
+                        }
+                    };
                 });
             }
         } catch (e) {
@@ -238,7 +282,7 @@ export const QueuePanel: React.FC = () => {
 
     const handlePlayVideo = (index: number) => {
         setActiveVideoIndex(index);
-        setPlaying(true);
+        // 去除自动播放逻辑，仅切换视频
     };
 
     return (
@@ -432,40 +476,80 @@ const QueueItem: React.FC<{
 
     // Context menu close listener
     useEffect(() => {
-        const handleClickOutside = () => setContextMenu(null);
+        const closeMenu = () => setContextMenu(null);
         if (contextMenu) {
-            window.addEventListener('click', handleClickOutside);
-            return () => window.removeEventListener('click', handleClickOutside);
+            window.addEventListener('click', closeMenu);
+            document.addEventListener('close-video-menus', closeMenu);
+            return () => {
+                window.removeEventListener('click', closeMenu);
+                document.removeEventListener('close-video-menus', closeMenu);
+            };
         }
     }, [contextMenu]);
 
     const handleContextMenu = (e: React.MouseEvent) => {
         e.preventDefault();
+        // 派发自定义事件，通知其他所有的菜单关闭，解决菜单重叠 bug
+        document.dispatchEvent(new CustomEvent('close-video-menus'));
         setContextMenu({ x: e.clientX, y: e.clientY, videoId: video.id });
+    };
+
+    const handleOpenFileLocation = async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        setContextMenu(null);
+        try {
+            // 【排错诊断代码】
+            console.log("====== 准备在文件夹中显示文件 ======");
+            console.log("原视频路径:", video.path);
+            
+            // Tauri v2 推荐使用 revealItemInDir 直接打开目录并高亮选中文件
+            await revealItemInDir(video.path);
+            console.log("命令已成功发送给系统。");
+        } catch (err) {
+            console.error("====== 打开文件夹失败 ======", err);
+            // 将错误信息直接弹窗显示，避免需要去控制台找
+            const errMsg = err instanceof Error ? err.message : (typeof err === 'string' ? err : JSON.stringify(err));
+            alert(`打开目录失败！\n\n目标路径：${video.path}\n\n底层错误原因：\n${errMsg}\n\n（请将此错误截图或复制告诉我）`);
+        }
     };
 
     const handleGenerateSubtitle = () => {
         const store = useQueueStore.getState();
         const settings = useSettingsStore.getState();
         const modelId = settings.selectedModelId;
-        const fakeId = 'ai-' + Date.now();
+        const subStore = useSubtitleStore.getState();
 
-        store.addSubtitleToVideo(video.id, {
-            id: fakeId,
-            name: `AI 字幕 (${modelId})`,
-            type: 'ai',
-            modelId: modelId
-        });
-        store.setActiveSubtitleId(video.id, fakeId);
+        // 查找是否已经有该模型生成的字幕轨
+        const existingTrack = video.subtitles?.find(s => s.type === 'ai' && s.modelId === modelId);
+        const trackId = existingTrack ? existingTrack.id : ('ai-' + Date.now());
+
+        if (!existingTrack) {
+            store.addSubtitleToVideo(video.id, {
+                id: trackId,
+                name: `AI 字幕 (${modelId})`,
+                type: 'ai',
+                modelId: modelId
+            });
+        }
+        store.setActiveSubtitleId(video.id, trackId);
+
+        // 核心：计算断点续传时间
+        let resumeOffset = 0;
+        if (existingTrack && subStore.cues.length > 0) {
+            const lastCue = subStore.cues[subStore.cues.length - 1];
+            // 只取当前这个轨道的最后一句时间
+            if (lastCue.id.toString().startsWith(trackId)) {
+                resumeOffset = lastCue.endTime;
+            }
+        }
 
         // Auto show subtitles if hidden
-        const subStore = useSubtitleStore.getState();
         if (!subStore.isVisible) {
             subStore.toggleVisible();
         }
 
         // Trigger socket call
-        subtitleClient.generate(video.id, video.path, fakeId);
+        subtitleClient.generate(video.id, video.path, trackId, resumeOffset);
         setContextMenu(null);
     };
 
@@ -498,23 +582,29 @@ const QueueItem: React.FC<{
                     }`}
             >
                 {/* Thumbnail placeholder */}
-                <div className="relative w-16 h-10 rounded-md overflow-hidden bg-[var(--color-bg-tertiary)] flex-shrink-0">
-                    <div className="absolute inset-0 flex items-center justify-center">
-                        <Play className="w-4 h-4 text-[var(--color-text-secondary)] opacity-50" />
-                    </div>
-                    {video.duration > 0 && (
-                        <div className="absolute bottom-0.5 right-0.5 px-1 py-0.5 bg-black/70 rounded text-[10px] text-white/80 font-mono">
-                            {formatTime(video.duration)}
+                <div className="relative w-16 h-10 rounded-md overflow-hidden bg-[var(--color-bg-tertiary)] flex-shrink-0 border border-black/20">
+                    {video.webPath ? (
+                        <video 
+                            src={`${video.webPath}#t=1`} 
+                            className="absolute inset-0 w-full h-full object-cover" 
+                            preload="metadata" 
+                            muted 
+                            playsInline 
+                        />
+                    ) : (
+                        <div className="absolute inset-0 flex items-center justify-center">
+                            <Play className="w-4 h-4 text-[var(--color-text-secondary)] opacity-50" />
                         </div>
                     )}
+                    <div className="absolute inset-0 bg-black/10 hover:bg-black/0 transition-colors pointer-events-none" />
                 </div>
 
                 {/* Info */}
-                <div className="flex-1 min-w-0">
-                    <p className={`text - sm truncate ${isActive ? 'text-[var(--color-accent)] font-medium' : 'text-[var(--color-text-primary)]'} `}>
+                <div className="flex-1 min-w-0 flex flex-col justify-center">
+                    <p className={`text-sm truncate ${isActive ? 'text-[var(--color-accent)] font-medium' : 'text-[var(--color-text-primary)]'}`}>
                         {video.name}
                     </p>
-                    <div className="flex items-center gap-2 mt-0.5">
+                    <div className="flex items-center gap-2 mt-1">
                         {/* Playing indicator */}
                         {isActive && (
                             <div className="flex items-center gap-[2px] h-3">
@@ -537,20 +627,27 @@ const QueueItem: React.FC<{
                     </div>
                 </div>
 
-                {/* Remove button */}
-                <AnimatePresence>
-                    {hover && !isActive && (
-                        <motion.button
-                            initial={{ opacity: 0, scale: 0.8 }}
-                            animate={{ opacity: 1, scale: 1 }}
-                            exit={{ opacity: 0, scale: 0.8 }}
-                            onClick={(e) => { e.stopPropagation(); onRemove(); }}
-                            className="p-1 rounded text-[var(--color-text-secondary)] hover:text-red-400 transition-colors flex-shrink-0"
-                        >
-                            <Trash2 className="w-3.5 h-3.5" />
-                        </motion.button>
+                {/* Right Area: Timestamp & Remove button */}
+                <div className="flex items-center gap-2 flex-shrink-0">
+                    {video.duration > 0 && (
+                        <span className="text-xs text-[var(--color-text-secondary)] font-mono text-right min-w-[75px]">
+                            {video.currentTime ? `${formatTime(video.currentTime)} / ` : ''}{formatTime(video.duration)}
+                        </span>
                     )}
-                </AnimatePresence>
+                    <AnimatePresence>
+                        {hover && !isActive && (
+                            <motion.button
+                                initial={{ opacity: 0, scale: 0.8, width: 0 }}
+                                animate={{ opacity: 1, scale: 1, width: 'auto' }}
+                                exit={{ opacity: 0, scale: 0.8, width: 0 }}
+                                onClick={(e) => { e.stopPropagation(); onRemove(); }}
+                                className="p-1 rounded text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-tertiary)] hover:text-red-400 transition-colors overflow-hidden"
+                            >
+                                <Trash2 className="w-3.5 h-3.5" />
+                            </motion.button>
+                        )}
+                    </AnimatePresence>
+                </div>
             </motion.div>
 
             {/* Right Click menu popup */}
@@ -572,17 +669,24 @@ const QueueItem: React.FC<{
                     </button>
                     <button
                         onClick={handleGenerateSubtitle}
-                        className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-[var(--color-accent)]"
+                        className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-[var(--color-text-primary)]"
                     >
                         <Sparkles className="w-4 h-4" />
                         AI 生成字幕
+                    </button>
+                    <button
+                        onClick={handleOpenFileLocation}
+                        className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-[var(--color-text-primary)]"
+                    >
+                        <FolderOpen className="w-4 h-4" />
+                        打开所在目录
                     </button>
                     <button
                         onClick={(e) => { e.stopPropagation(); onRemove(); setContextMenu(null); }}
                         className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-red-400"
                     >
                         <Trash2 className="w-4 h-4" />
-                        删除视频
+                        移除该视频
                     </button>
                 </div>
             )}

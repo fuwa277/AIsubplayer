@@ -1,7 +1,7 @@
 import { readTextFile } from '@tauri-apps/plugin-fs';
 import { SubtitleCue } from '../stores/subtitleStore';
 
-export async function parseSrt(path: string): Promise<SubtitleCue[]> {
+export async function parseSrt(path: string, trackId?: string): Promise<SubtitleCue[]> {
     const content = await readTextFile(path);
     // basic SRT parser
     const blocks = content.replace(/\r\n/g, '\n').split('\n\n').filter(Boolean);
@@ -32,7 +32,7 @@ export async function parseSrt(path: string): Promise<SubtitleCue[]> {
                 }
 
                 cues.push({
-                    id: 'ext-' + idx + '-' + Date.now().toString().slice(-4),
+                    id: trackId ? `${trackId}-${idx}` : 'ext-' + idx + '-' + Date.now().toString().slice(-4),
                     startTime,
                     endTime,
                     text: text,

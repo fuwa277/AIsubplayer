@@ -1,6 +1,8 @@
 import React, { useRef, useEffect, useCallback } from 'react';
 import { usePlayerStore } from '../stores/playerStore';
 import { useQueueStore } from '../stores/queueStore';
+import { useSubtitleStore } from '../stores/subtitleStore';
+import { parseSrt } from '../services/srtParser';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Pause } from 'lucide-react';
 
@@ -100,10 +102,49 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoRef }) => {
         }
     }, [isPlaying, videoRef]);
 
+    // Auto-load subtitle when active video or subtitle track changes
+    useEffect(() => {
+        const loadSubtitles = async () => {
+            const subStore = useSubtitleStore.getState();
+
+            if (!activeVideo || !activeVideo.activeSubtitleId) {
+                subStore.clearCues();
+                return;
+            }
+
+            // 如果正在生成中，不要从本地频繁加载覆盖内存，以免打断推流和引发数据冲突
+            if (activeVideo.subtitleStatus === 'generating') {
+                return;
+            }
+
+            const activeTrack = activeVideo.subtitles?.find(s => s.id === activeVideo.activeSubtitleId);
+            if (activeTrack && activeTrack.path) {
+                try {
+                    const cues = await parseSrt(activeTrack.path, activeTrack.id);
+                    subStore.setCues(cues);
+                } catch (e) {
+                    console.error("Failed to load subtitle from disk:", e);
+                }
+            } else {
+                subStore.clearCues();
+            }
+        };
+        loadSubtitles();
+    }, [activeVideo?.id, activeVideo?.activeSubtitleId, activeVideo?.subtitleStatus]);
+
     // Load video source
     useEffect(() => {
         const video = videoRef.current;
-        if (!video || !activeVideo) return;
+        if (!video) return;
+
+        if (!activeVideo) {
+            // 当队列被清空，没有激活的视频时，暂停并剥离视频源
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            return;
+        }
+
         // Use convertFileSrc for Tauri or direct path for dev
         const src = activeVideo.webPath || activeVideo.path;
         if (video.src !== src) {

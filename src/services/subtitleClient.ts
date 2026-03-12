@@ -6,7 +6,7 @@ import { writeTextFile } from '@tauri-apps/plugin-fs';
 class SubtitleClient {
     private wsMap = new Map<string, WebSocket>();
 
-    public async generate(videoId: string, videoPath: string, trackId: string) {
+    public async generate(videoId: string, videoPath: string, trackId: string, resumeOffset: number = 0) {
         // Disconnect previous for this specific video if exists
         this.stop(videoId);
 
@@ -16,7 +16,11 @@ class SubtitleClient {
 
         // Mark starting
         queueStore.updateVideoSubtitleStatus(videoId, 'generating', 0);
-        subStore.clearCues(); // We'll stream new cues into the store
+        
+        // 如果是从头生成才清空；如果是断点续传则保留原有内容在界面上
+        if (resumeOffset === 0) {
+            subStore.clearCues(); 
+        }
 
         const wsUrl = `ws://127.0.0.1:${settings.backendPort}/api/ws/transcribe/${videoId}`;
         const ws = new WebSocket(wsUrl);
@@ -39,7 +43,8 @@ class SubtitleClient {
                 batch_length: settings.batchLength,
                 max_segment_length: settings.maxSegmentLength,
                 word_timestamps: true, // Force enabled since UI wants to support hit-ENTER to split
-                remove_punctuation: false // TBD expose setting if requested
+                remove_punctuation: false, // TBD expose setting if requested
+                resume_offset: resumeOffset // 将前端算好的断点时间发给后端
             };
             ws.send(JSON.stringify(config));
         };
@@ -71,6 +76,9 @@ class SubtitleClient {
                         const prog = Math.min((chunk.end_time / video.duration) * 100, 99.9);
                         qStore.updateVideoSubtitleStatus(videoId, 'generating', parseFloat(prog.toFixed(1)), '正在生成字幕...');
                     }
+                    
+                    // 每次收到新字幕块，立刻实时写入本地磁盘，保证异常中断也不会丢失进度
+                    this.saveSrtToDisk(videoPath, trackId);
                 } else if (message.type === 'progress') {
                     if (message.message) {
                         useQueueStore.getState().updateVideoSubtitleStatus(videoId, 'generating', undefined, message.message);

@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Clock, Search, Edit3, Check, X } from 'lucide-react';
+import { Clock, Search, Edit3, Check, X, Download } from 'lucide-react';
 import { useSubtitleStore, SubtitleCue } from '../stores/subtitleStore';
 import { usePlayerStore } from '../stores/playerStore';
 import { formatTime } from '../utils';
@@ -55,18 +55,52 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
         )
         : cues;
 
+    const handleExportSrt = () => {
+        if (cues.length === 0) return;
+        const formatTimeSrt = (seconds: number) => {
+            const date = new Date(seconds * 1000);
+            const hh = String(Math.floor(seconds / 3600)).padStart(2, '0');
+            const mm = String(date.getUTCMinutes()).padStart(2, '0');
+            const ss = String(date.getUTCSeconds()).padStart(2, '0');
+            const ms = String(date.getUTCMilliseconds()).padStart(3, '0');
+            return `${hh}:${mm}:${ss},${ms}`;
+        };
+        const srtContent = cues.map((cue, index) => {
+            return `${index + 1}\n${formatTimeSrt(cue.startTime)} --> ${formatTimeSrt(cue.endTime)}\n${cue.text}\n`;
+        }).join('\n');
+
+        const blob = new Blob([srtContent], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `subtitle_export_${Date.now()}.srt`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    };
+
     return (
         <div className="h-full flex flex-col">
             {/* Header with search */}
             <div className="px-3 py-2 border-b border-[var(--color-border)]">
-                <div className="relative">
-                    <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[var(--color-text-secondary)]" />
-                    <input
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        placeholder="搜索字幕内容..."
-                        className="w-full pl-8 pr-3 py-1.5 text-sm rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] outline-none focus:border-[var(--color-accent)] text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/50"
-                    />
+                <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[var(--color-text-secondary)]" />
+                        <input
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            placeholder="搜索字幕内容..."
+                            className="w-full pl-8 pr-3 py-1.5 text-sm rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] outline-none focus:border-[var(--color-accent)] text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/50"
+                        />
+                    </div>
+                    <button
+                        onClick={handleExportSrt}
+                        title="导出为 SRT 文件"
+                        className="p-1.5 rounded-lg bg-[var(--color-bg-tertiary)] text-[var(--color-text-secondary)] hover:text-[var(--color-accent)] hover:bg-[var(--color-bg-secondary)] transition-colors flex-shrink-0"
+                    >
+                        <Download className="w-4 h-4" />
+                    </button>
                 </div>
                 {/* Generation progress */}
                 {isGenerating && (
