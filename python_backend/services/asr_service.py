@@ -113,46 +113,142 @@ class ASRService:
                 except Exception as e:
                     print(f"Failed loading glossary: {e}")
 
-            # 步骤 3: 喂给 faster-whisper 执行转录
+            # 步骤 3: 喂给 faster-whisper 执行转录 (采用分块处理以极速响应)
             print(f"Starting actual transcription on audio trace, using glossary: {bool(initial_prompt)}")
             if on_progress:
-                on_progress("音频提取完毕，模型开始正式推理生成字幕...")
+                on_progress("音频提取完毕，开始分块并行推理...")
             
-            segments, info = model.transcribe(
-                audio_path,
-                beam_size=5,
-                language=language,
-                vad_filter=request.vad_enabled,
-                vad_parameters=dict(min_silence_duration_ms=500) if request.vad_enabled else None,
-                word_timestamps=request.word_timestamps,
-                initial_prompt=initial_prompt
-            )
+            import tempfile
+            import subprocess
             
+            # 获取总时长
+            total_duration = 0
+            try:
+                dur_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
+                total_duration = float(subprocess.check_output(dur_cmd).decode('utf-8').strip())
+            except:
+                pass # 获取失败则fallback
+
+            import re
+            
+            TARGET_CHUNK = 300  # 目标基础切块时长(5分钟)
+            BUFFER = 60         # 往后多找60秒寻找静音点
+            current_start = 0
             _id = 1
-            for segment in segments:
-                text = segment.text.strip()
-                if request.remove_punctuation:
-                    # 去除常见中英文标点符号
-                    text = text.translate(str.maketrans('', '', string.punctuation + '，、。！？；：（）《》【】“”‘’'))
+            
+            # 如果断点续传处理过 audio_path，那么这里的 current_start 从 0 算起，因为传给它的 audio 已经是切好的
+            # base_offset 才是真实时间轴的偏移
+            base_offset = request.resume_offset
+            
+            def get_smart_cut_length(start_t):
+                # 剩余时间不足以组成一个完整的块时，直接返回剩余时间
+                if total_duration > 0 and start_t + TARGET_CHUNK >= total_duration:
+                    return total_duration - start_t
+                
+                # 截取 [start_t, start_t + TARGET_CHUNK + BUFFER] 进行快速静音检测 (-ss放前面极速定位)
+                cmd = [
+                    "ffmpeg", "-y", "-ss", str(start_t), "-t", str(TARGET_CHUNK + BUFFER),
+                    "-i", audio_path,
+                    "-af", "silencedetect=noise=-30dB:d=0.5",
+                    "-f", "null", "-"
+                ]
+                try:
+                    # Windows 下 ffmpeg 可能会因为编码导致输出报错，指定 errors='ignore' 增强鲁棒性
+                    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore')
                     
-                words = []
-                if request.word_timestamps and getattr(segment, 'words', None):
-                    for w in segment.words:
-                        wt = w.word.strip()
-                        if request.remove_punctuation:
-                            wt = wt.translate(str.maketrans('', '', string.punctuation + '，、。！？；：（）《》【】“”‘’'))
-                        if wt:
-                            words.append(WordTimestamp(start=w.start + request.resume_offset, end=w.end + request.resume_offset, word=wt))
-                            
-                yield SubtitleSegment(
-                    id=_id,
-                    start_time=segment.start + request.resume_offset,
-                    end_time=segment.end + request.resume_offset,
-                    text=text,
-                    original_text=None,
-                    words=words if request.word_timestamps else None
+                    # 如果 ffmpeg 运行失败，这里能看到原因
+                    if result.returncode != 0:
+                        print(f"[ASR Error] FFmpeg silencedetect failed: {result.stderr}")
+                    
+                    silences = []
+                    for line in result.stderr.split('\n'):
+                        if "silence_start:" in line:
+                            match = re.search(r"silence_start:\s+([\d\.]+)", line)
+                            if match:
+                                silences.append(float(match.group(1)))
+                    
+                    # 寻找位于这几分钟内的静音点。
+                    # 为了不让切块变得太碎，我们只取时间 > (TARGET_CHUNK - 120 秒) 的静音点
+                    valid_silences = [s for s in silences if s > (TARGET_CHUNK - 120)]
+                    if valid_silences:
+                        # 选最后那个最符合条件的静音点，加上 0.2 秒的余量，确保它切在断句的“呼吸间隙”中
+                        best_len = valid_silences[-1] + 0.2
+                        # 兜底防御：确保这个值是合理的（防止算出来是负数或者死循环）
+                        if best_len > 60 and best_len < (TARGET_CHUNK + BUFFER):
+                            return best_len
+                except Exception as e:
+                    print(f"Silence detect failed: {e}")
+                    
+                # 如果找不到合适的静音点，或者发生了任何异常，回退到生硬地切成 300 秒
+                return TARGET_CHUNK
+            
+            while True:
+                if total_duration > 0 and current_start >= total_duration:
+                    break
+                    
+                # 动态计算本次切块的具体时长（智能寻找无声段落）
+                chunk_length = get_smart_cut_length(current_start)
+                
+                chunk_file = os.path.join(tempfile.gettempdir(), f"chunk_{current_start}_{os.path.basename(audio_path)}")
+                
+                # 开始切割，注意 -ss 依然在前以保证极高的切割速度
+                slice_cmd = ["ffmpeg", "-y", "-ss", str(current_start), "-t", str(chunk_length), "-i", audio_path, "-c", "copy", chunk_file]
+                try:
+                    # 去掉 capture_output 以便在控制台看到 ffmpeg 的原生输出
+                    subprocess.run(slice_cmd, check=True)
+                except Exception as e:
+                    print(f"Chunk slice failed or EOF: {e}")
+                    # 如果是由于 ffmpeg 找不到导致崩溃，这里会报错
+                    break
+                    
+                # 检查切出的文件是否有效（大小>0）
+                if not os.path.exists(chunk_file) or os.path.getsize(chunk_file) < 1000:
+                    break
+                
+                if on_progress:
+                    on_progress(f"正在推理时间段 {current_start // 60:.1f}分 - {(current_start + chunk_length) // 60:.1f}分 ...")
+
+                segments, info = model.transcribe(
+                    chunk_file,
+                    beam_size=5,
+                    language=language,
+                    vad_filter=request.vad_enabled,
+                    vad_parameters=dict(min_silence_duration_ms=500) if request.vad_enabled else None,
+                    word_timestamps=request.word_timestamps,
+                    initial_prompt=initial_prompt
                 )
-                _id += 1
+                
+                for segment in segments:
+                    text = segment.text.strip()
+                    if request.remove_punctuation:
+                        text = text.translate(str.maketrans('', '', string.punctuation + '，、。！？；：（）《》【】“”‘’'))
+                        
+                    words = []
+                    if request.word_timestamps and getattr(segment, 'words', None):
+                        for w in segment.words:
+                            wt = w.word.strip()
+                            if request.remove_punctuation:
+                                wt = wt.translate(str.maketrans('', '', string.punctuation + '，、。！？；：（）《》【】“”‘’'))
+                            if wt:
+                                words.append(WordTimestamp(start=w.start + base_offset + current_start, end=w.end + base_offset + current_start, word=wt))
+                                
+                    yield SubtitleSegment(
+                        id=_id,
+                        start_time=segment.start + base_offset + current_start,
+                        end_time=segment.end + base_offset + current_start,
+                        text=text,
+                        original_text=None,
+                        words=words if request.word_timestamps else None
+                    )
+                    _id += 1
+                
+                try:
+                    os.remove(chunk_file)
+                except:
+                    pass
+                    
+                # 进度往前推进这一块的实际时间
+                current_start += chunk_length
                 
         except Exception as e:
             print(f"ASR Pipeline Error: {e}")

@@ -53,6 +53,22 @@ async def websocket_endpoint(websocket: WebSocket, video_id: str):
                 loop
             )
 
+        # 组装 SRT 文件路径
+        import os
+        import re
+        v_dir = os.path.dirname(req.video_path)
+        v_name = os.path.splitext(os.path.basename(req.video_path))[0]
+        safe_model_id = re.sub(r'[\/\\:*?"<>|]', '-', req.model_id)
+        srt_filename = f"{v_name}.{req.target_language if hasattr(req, 'target_language') else 'auto'}-AI-{safe_model_id}.srt"
+        srt_path = os.path.join(v_dir, srt_filename)
+
+        def format_srt_time(seconds):
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            s = int(seconds % 60)
+            ms = int((seconds % 1) * 1000)
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
         # 真正调用 Faster Whisper 翻译
         def generate_subtitles():
             for segment in asr_service.transcribe_video(req, on_progress=progress_callback):
@@ -60,22 +76,53 @@ async def websocket_endpoint(websocket: WebSocket, video_id: str):
 
         generator = generate_subtitles()
         
-        while True:
+        chunk_idx = 1
+        # 如果是断点续传，读取已有行数以继续编号，并使用追加模式
+        if req.resume_offset > 0 and os.path.exists(srt_path):
+            mode = "a"
             try:
-                # 在单独的线程中获取下一个片段避免阻塞主事件循环
-                segment = await loop.run_in_executor(None, next, generator)
-                await websocket.send_text(json.dumps({
-                    "type": "subtitle_chunk", 
-                    "data": segment.model_dump()
-                }))
-            except StopIteration:
-                break
-            except Exception as e:
-                print(f"Transcription error: {e}")
-                await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
-                break
+                with open(srt_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    chunk_idx = content.count("-->") + 1
+            except:
+                pass
+        else:
+            mode = "w"
+
+        try:
+            with open(srt_path, mode, encoding="utf-8") as srt_file:
+                while True:
+                    try:
+                        # 在单独的线程中获取下一个片段避免阻塞主事件循环
+                        segment = await loop.run_in_executor(None, next, generator)
+                        
+                        # 实时写入后端文件
+                        srt_file.write(f"{chunk_idx}\n")
+                        srt_file.write(f"{format_srt_time(segment.start_time)} --> {format_srt_time(segment.end_time)}\n")
+                        srt_file.write(f"{segment.text}\n")
+                        if getattr(segment, 'original_text', None):
+                            srt_file.write(f"{segment.original_text}\n")
+                        srt_file.write("\n")
+                        srt_file.flush() # 强制立刻刷入磁盘
+                        os.fsync(srt_file.fileno()) # 确保落盘
+                        
+                        chunk_idx += 1
+
+                        await websocket.send_text(json.dumps({
+                            "type": "subtitle_chunk", 
+                            "data": segment.model_dump()
+                        }))
+                    except StopIteration:
+                        break
+                    except Exception as e:
+                        print(f"Transcription error: {e}")
+                        await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+                        break
+        except Exception as file_e:
+            print(f"Failed to open SRT file for writing: {file_e}")
+            await websocket.send_text(json.dumps({"type": "error", "message": f"后端无权限或无法写入字幕文件: {str(file_e)}"}))
         
-        await websocket.send_text(json.dumps({"type": "transcribe_done"}))
+        await websocket.send_text(json.dumps({"type": "transcribe_done", "srt_path": srt_path}))
             
     except WebSocketDisconnect:
         # 前端主动断开 / 中止任务

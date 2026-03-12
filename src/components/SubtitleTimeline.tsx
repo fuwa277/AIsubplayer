@@ -3,7 +3,10 @@ import { motion } from 'framer-motion';
 import { Clock, Search, Edit3, Check, X, Download } from 'lucide-react';
 import { useSubtitleStore, SubtitleCue } from '../stores/subtitleStore';
 import { usePlayerStore } from '../stores/playerStore';
+import { useQueueStore } from '../stores/queueStore';
 import { formatTime } from '../utils';
+import { save } from '@tauri-apps/plugin-dialog';
+import { writeSrt } from '../services/srtParser';
 
 interface SubtitleTimelineProps {
     videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -40,6 +43,20 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
             splitAndUpdateCue(editingId, editText);
             setEditingId(null);
             setEditText('');
+            
+            // 延迟以确保 Zustand 的 state 已经更新完成，然后覆写物理文件
+            setTimeout(async () => {
+                const updatedCues = useSubtitleStore.getState().cues;
+                const activeVideo = useQueueStore.getState().getActiveVideo();
+                if (activeVideo && activeVideo.activeSubtitleId) {
+                    const activeTrack = activeVideo.subtitles?.find(s => s.id === activeVideo.activeSubtitleId);
+                    if (activeTrack && activeTrack.path) {
+                        try {
+                            await writeSrt(activeTrack.path, updatedCues);
+                        } catch(e) { console.error("Auto-save failed:", e); }
+                    }
+                }
+            }, 100);
         }
     };
 
@@ -55,29 +72,19 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
         )
         : cues;
 
-    const handleExportSrt = () => {
+    const handleExportSrt = async () => {
         if (cues.length === 0) return;
-        const formatTimeSrt = (seconds: number) => {
-            const date = new Date(seconds * 1000);
-            const hh = String(Math.floor(seconds / 3600)).padStart(2, '0');
-            const mm = String(date.getUTCMinutes()).padStart(2, '0');
-            const ss = String(date.getUTCSeconds()).padStart(2, '0');
-            const ms = String(date.getUTCMilliseconds()).padStart(3, '0');
-            return `${hh}:${mm}:${ss},${ms}`;
-        };
-        const srtContent = cues.map((cue, index) => {
-            return `${index + 1}\n${formatTimeSrt(cue.startTime)} --> ${formatTimeSrt(cue.endTime)}\n${cue.text}\n`;
-        }).join('\n');
-
-        const blob = new Blob([srtContent], { type: 'text/plain;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `subtitle_export_${Date.now()}.srt`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        try {
+            const filePath = await save({
+                filters: [{ name: 'SRT Subtitle', extensions: ['srt'] }],
+                defaultPath: `subtitle_export_${Date.now()}.srt`
+            });
+            if (filePath) {
+                await writeSrt(filePath, cues);
+            }
+        } catch (e) {
+            console.error("Failed to export SRT:", e);
+        }
     };
 
     return (

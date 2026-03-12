@@ -1,5 +1,27 @@
-import { readTextFile } from '@tauri-apps/plugin-fs';
+import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { SubtitleCue } from '../stores/subtitleStore';
+
+export function formatSrtTimeStr(seconds: number): string {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    const ms = Math.floor((seconds % 1) * 1000);
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`;
+}
+
+export async function writeSrt(path: string, cues: SubtitleCue[]) {
+    let srtContent = '';
+    cues.forEach((cue, index) => {
+        srtContent += `${index + 1}\n`;
+        srtContent += `${formatSrtTimeStr(cue.startTime)} --> ${formatSrtTimeStr(cue.endTime)}\n`;
+        srtContent += `${cue.text}\n`;
+        if (cue.originalText) {
+            srtContent += `${cue.originalText}\n`;
+        }
+        srtContent += '\n';
+    });
+    await writeTextFile(path, srtContent);
+}
 
 export async function parseSrt(path: string, trackId?: string): Promise<SubtitleCue[]> {
     const content = await readTextFile(path);

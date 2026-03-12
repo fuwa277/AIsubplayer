@@ -1,10 +1,10 @@
 import { useSubtitleStore } from '../stores/subtitleStore';
 import { useQueueStore } from '../stores/queueStore';
 import { useSettingsStore } from '../stores/settingsStore';
-import { writeTextFile } from '@tauri-apps/plugin-fs';
 
 class SubtitleClient {
     private wsMap = new Map<string, WebSocket>();
+    private sessionCues = new Map<string, import('../stores/subtitleStore').SubtitleCue[]>();
 
     public async generate(videoId: string, videoPath: string, trackId: string, resumeOffset: number = 0) {
         // Disconnect previous for this specific video if exists
@@ -19,7 +19,14 @@ class SubtitleClient {
         
         // 如果是从头生成才清空；如果是断点续传则保留原有内容在界面上
         if (resumeOffset === 0) {
-            subStore.clearCues(); 
+            this.sessionCues.set(videoId, []);
+            if (queueStore.getActiveVideo()?.id === videoId) {
+                subStore.clearCues(); 
+            }
+        } else {
+            // 将现有的该轨道字幕载入后台缓冲池，避免覆盖丢失
+            const currentCues = subStore.cues.filter(c => c.id.toString().startsWith(trackId));
+            this.sessionCues.set(videoId, currentCues);
         }
 
         const wsUrl = `ws://127.0.0.1:${settings.backendPort}/api/ws/transcribe/${videoId}`;
@@ -56,29 +63,35 @@ class SubtitleClient {
                 if (message.type === 'subtitle_chunk') {
                     const chunk = message.data;
                     // chunk matched the Pydantic schema SubtitleSegment
-                    // mapping to our SubtitleCue
-                    subStore.addCue({
+                    const newCue = {
                         id: trackId + '-' + chunk.id,
                         startTime: chunk.start_time,
                         endTime: chunk.end_time,
                         text: chunk.text,
                         originalText: chunk.original_text,
                         words: chunk.words
-                    });
+                    };
+
+                    // 保存到后台隔离缓冲池
+                    const cues = this.sessionCues.get(videoId) || [];
+                    cues.push(newCue);
+                    this.sessionCues.set(videoId, cues);
+
+                    const qStore = useQueueStore.getState();
+
+                    // 只有当当前正在播放的视频是该生成任务的视频时，才同步更新前端UI
+                    if (qStore.getActiveVideo()?.id === videoId) {
+                        subStore.addCue(newCue);
+                    }
 
                     // Simple progress calculation simulation: 
-                    // To do it accurately we'd need total duration. Let queueStore just read total cues found for now.
-                    // For UI, we can just say "generating" dynamically.
-                    const qStore = useQueueStore.getState();
-                    // Just update a ticking progress to let user know it's alive, or mapping to video duration
                     const video = qStore.queues.flatMap(q => q.items).find(v => v.id === videoId);
                     if (video && video.duration > 0) {
                         const prog = Math.min((chunk.end_time / video.duration) * 100, 99.9);
                         qStore.updateVideoSubtitleStatus(videoId, 'generating', parseFloat(prog.toFixed(1)), '正在生成字幕...');
                     }
                     
-                    // 每次收到新字幕块，立刻实时写入本地磁盘，保证异常中断也不会丢失进度
-                    this.saveSrtToDisk(videoPath, trackId);
+                    // 后端会实时写入字幕文件，前端只需更新状态
                 } else if (message.type === 'progress') {
                     if (message.message) {
                         useQueueStore.getState().updateVideoSubtitleStatus(videoId, 'generating', undefined, message.message);
@@ -87,8 +100,7 @@ class SubtitleClient {
                     console.log("Transmission stream finished");
                     useQueueStore.getState().updateVideoSubtitleStatus(videoId, 'done', 100);
 
-                    // Start saving SRT to local disk
-                    this.saveSrtToDisk(videoPath, trackId);
+                    // 后端已完成字幕文件的最终写入
 
                     this.stop(videoId);
                 } else if (message.type === 'error') {
@@ -112,6 +124,10 @@ class SubtitleClient {
         };
     }
 
+    public getSessionCues(videoId: string) {
+        return this.sessionCues.get(videoId) || [];
+    }
+
     public stop(videoId: string) {
         const ws = this.wsMap.get(videoId);
         if (ws) {
@@ -120,66 +136,6 @@ class SubtitleClient {
         }
     }
 
-    private formatSrtTime(seconds: number): string {
-        const h = Math.floor(seconds / 3600);
-        const m = Math.floor((seconds % 3600) / 60);
-        const s = Math.floor(seconds % 60);
-        const ms = Math.floor((seconds % 1) * 1000);
-        return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`;
     }
-
-    private async saveSrtToDisk(videoPath: string, trackId: string) {
-        try {
-            const subStore = useSubtitleStore.getState();
-            // Filter out the cues for this specific generation pass if multiple exist
-            // using the trackId prefix.
-            const cues = subStore.cues.filter(c => c.id.toString().startsWith(trackId));
-            if (cues.length === 0) return;
-
-            let srtContent = '';
-            cues.forEach((cue, index) => {
-                srtContent += `${index + 1}\n`;
-                srtContent += `${this.formatSrtTime(cue.startTime)} --> ${this.formatSrtTime(cue.endTime)}\n`;
-                srtContent += `${cue.text}\n`;
-                if (cue.originalText) {
-                    srtContent += `${cue.originalText}\n`;
-                }
-                srtContent += '\n';
-            });
-
-            // Make the SRT path based on video path
-            // Handle both windows backslashes and unix forward slashes
-            const isWin = videoPath.includes('\\');
-            const sep = isWin ? '\\' : '/';
-            const parts = videoPath.split(sep);
-            const filename = parts[parts.length - 1];
-            const extIdx = filename.lastIndexOf('.');
-            const baseName = extIdx > 0 ? filename.substring(0, extIdx) : filename;
-
-            const modelId = useSettingsStore.getState().selectedModelId;
-            const targetLanguage = useSettingsStore.getState().targetLanguage;
-            // Examples: MyVideo.zh-AI-large-v3.srt
-            const newFilename = `${baseName}.${targetLanguage}-AI-${modelId}.srt`;
-
-            parts[parts.length - 1] = newFilename;
-            const srtPath = parts.join(sep);
-
-            await writeTextFile(srtPath, srtContent);
-            console.log(`Saved automatically generated subtitle to ${srtPath}`);
-
-            // Update queue store to attach this physical file to the track
-            const qStore = useQueueStore.getState();
-            qStore.queues.forEach(q => q.items.forEach(v => {
-                const tr = v.subtitles?.find(s => s.id === trackId);
-                if (tr) {
-                    tr.path = srtPath;
-                }
-            }));
-
-        } catch (err) {
-            console.error("Failed to write SRT file to disk automatically.", err);
-        }
-    }
-}
 
 export const subtitleClient = new SubtitleClient();

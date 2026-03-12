@@ -124,6 +124,27 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoRef }) => {
                     subStore.setCues(cues);
                 } catch (e) {
                     console.error("Failed to load subtitle from disk:", e);
+                    // 自动卸载已经不存在或损坏的字幕轨道
+                    const qStore = useQueueStore.getState();
+                    const queues = qStore.queues.map(q => ({
+                        ...q,
+                        items: q.items.map(v => {
+                            if (v.id === activeVideo.id) {
+                                const remainingSubs = v.subtitles?.filter(s => s.id !== activeTrack.id) || [];
+                                return {
+                                    ...v,
+                                    subtitles: remainingSubs,
+                                    activeSubtitleId: remainingSubs.length > 0 ? remainingSubs[0].id : null,
+                                    subtitleStatus: 'none' as const,
+                                    subtitleProgress: 0,
+                                    subtitleStatusMsg: undefined
+                                };
+                            }
+                            return v;
+                        })
+                    }));
+                    useQueueStore.setState({ queues });
+                    subStore.clearCues();
                 }
             } else {
                 subStore.clearCues();

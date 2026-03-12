@@ -78,18 +78,7 @@ export const QueuePanel: React.FC = () => {
 
     /** 等待后端就绪（最多 60 秒）。在等待期间把 video 状态改为提示文字。*/
     const waitForBackend = async (): Promise<boolean> => {
-        const port = useSettingsStore.getState().backendPort;
-        const url = `http://127.0.0.1:${port}/`;
-        const deadline = Date.now() + 60_000;
-        while (Date.now() < deadline) {
-            if (useLogStore.getState().backendCrashed) return false;
-            try {
-                const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
-                if (r.ok) return true;
-            } catch { }
-            await new Promise(r => setTimeout(r, 1000));
-        }
-        return false;
+        return await waitForBackendHelper();
     };
 
     // 顺序字幕生成执行器
@@ -252,18 +241,8 @@ export const QueuePanel: React.FC = () => {
                     tempVid.preload = 'metadata';
                     tempVid.src = webPath;
                     tempVid.onloadedmetadata = () => {
-                        const store = useQueueStore.getState();
-                        const targetQueue = store.queues.find(q => q.id === activeQueueId);
-                        if (targetQueue) {
-                            const vIndex = targetQueue.items.findIndex(v => v.id === videoId);
-                            if (vIndex !== -1) {
-                                const newQueues = store.queues.map(q => q.id === activeQueueId ? {
-                                    ...q,
-                                    items: q.items.map(v => v.id === videoId ? { ...v, duration: tempVid.duration } : v)
-                                } : q);
-                                useQueueStore.setState({ queues: newQueues });
-                            }
-                        }
+                        // 统一调用 Store 方法更新时长，确保正确写入 localStorage 并触发响应式
+                        useQueueStore.getState().updateVideoDuration(videoId, tempVid.duration);
                     };
                 });
             }
@@ -281,8 +260,16 @@ export const QueuePanel: React.FC = () => {
     };
 
     const handlePlayVideo = (index: number) => {
+        const activeQueue = useQueueStore.getState().queues.find(q => q.id === useQueueStore.getState().activeQueueId);
+        const video = activeQueue?.items[index];
+        if (video) {
+            // 如果切换的视频正在生成，把后台缓冲池的字幕重新塞给前台 Store，解决失踪问题
+            const sessionCues = subtitleClient.getSessionCues(video.id);
+            if (sessionCues && sessionCues.length > 0) {
+                useSubtitleStore.getState().setCues(sessionCues);
+            }
+        }
         setActiveVideoIndex(index);
-        // 去除自动播放逻辑，仅切换视频
     };
 
     return (
@@ -455,6 +442,22 @@ interface ContextMenuData {
     videoId: string;
 }
 
+// 等待后台唤醒辅助函数
+const waitForBackendHelper = async (): Promise<boolean> => {
+    const port = useSettingsStore.getState().backendPort;
+    const url = `http://127.0.0.1:${port}/`;
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+        if (useLogStore.getState().backendCrashed) return false;
+        try {
+            const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
+            if (r.ok) return true;
+        } catch { }
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    return false;
+};
+
 // Individual queue item component
 const QueueItem: React.FC<{
     video: VideoItem;
@@ -513,11 +516,20 @@ const QueueItem: React.FC<{
         }
     };
 
-    const handleGenerateSubtitle = () => {
+    const handleGenerateSubtitle = async () => {
         const store = useQueueStore.getState();
         const settings = useSettingsStore.getState();
         const modelId = settings.selectedModelId;
         const subStore = useSubtitleStore.getState();
+
+        // 防错缓冲：等待后台唤醒
+        store.updateVideoSubtitleStatus(video.id, 'generating', 0, '正在等待后台服务唤醒...');
+        const backendOk = await waitForBackendHelper();
+        if (!backendOk) {
+            store.updateVideoSubtitleStatus(video.id, 'error', 0, '后台唤醒失败，请重试');
+            setContextMenu(null);
+            return;
+        }
 
         // 查找是否已经有该模型生成的字幕轨
         const existingTrack = video.subtitles?.find(s => s.type === 'ai' && s.modelId === modelId);
@@ -621,7 +633,7 @@ const QueueItem: React.FC<{
                             isQueued={isInBatchQueue}
                             onCancel={video.subtitleStatus === 'generating' || video.subtitleStatus === 'pending' ? () => {
                                 subtitleClient.stop(video.id);
-                                useQueueStore.getState().updateVideoSubtitleStatus(video.id, 'none');
+                                useQueueStore.getState().updateVideoSubtitleStatus(video.id, 'paused', undefined, '已手动取消');
                             } : undefined}
                         />
                     </div>
@@ -667,13 +679,32 @@ const QueueItem: React.FC<{
                         <Play className="w-4 h-4" />
                         播放视频
                     </button>
-                    <button
-                        onClick={handleGenerateSubtitle}
-                        className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-[var(--color-text-primary)]"
-                    >
-                        <Sparkles className="w-4 h-4" />
-                        AI 生成字幕
-                    </button>
+                    {video.subtitleStatus === 'generating' || video.subtitleStatus === 'pending' ? (
+                        <>
+                            <button
+                                onClick={(e) => { e.stopPropagation(); subtitleClient.stop(video.id); useQueueStore.getState().updateVideoSubtitleStatus(video.id, 'paused', undefined, '已手动暂停'); setContextMenu(null); }}
+                                className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-amber-400"
+                            >
+                                <span className="w-4 h-4 flex items-center justify-center text-xs">⏸</span>
+                                暂停生成任务
+                            </button>
+                            <button
+                                onClick={(e) => { e.stopPropagation(); subtitleClient.stop(video.id); useQueueStore.getState().updateVideoSubtitleStatus(video.id, 'none', 0, ''); setContextMenu(null); }}
+                                className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-red-400"
+                            >
+                                <span className="w-4 h-4 flex items-center justify-center text-xs">⏹</span>
+                                取消并清空进度
+                            </button>
+                        </>
+                    ) : (
+                        <button
+                            onClick={handleGenerateSubtitle}
+                            className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-[var(--color-text-primary)]"
+                        >
+                            <Sparkles className="w-4 h-4" />
+                            {video.subtitleStatus === 'paused' ? '继续 AI 生成' : 'AI 生成字幕'}
+                        </button>
+                    )}
                     <button
                         onClick={handleOpenFileLocation}
                         className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-[var(--color-text-primary)]"
