@@ -23,7 +23,7 @@ interface ControlBarProps {
 export const ControlBar: React.FC<ControlBarProps> = ({ videoRef, onOpenSettings }) => {
     const {
         isPlaying, togglePlay, currentTime, duration, volume, isMuted, toggleMute, setVolume,
-        playbackRate, setPlaybackRate
+        playbackRate, setPlaybackRate, setControlsVisible
     } = usePlayerStore();
     const { theme, toggleTheme, sidebarOpen, toggleSidebar } = useSettingsStore();
     const { isVisible: subtitleVisible, toggleVisible: toggleSubtitle } = useSubtitleStore();
@@ -48,15 +48,20 @@ export const ControlBar: React.FC<ControlBarProps> = ({ videoRef, onOpenSettings
     // Auto-hide logic
     const showBar = useCallback(() => {
         setIsVisible(true);
+        setControlsVisible(true);
         if (hideTimer.current) clearTimeout(hideTimer.current);
         hideTimer.current = window.setTimeout(() => {
-            if (!isDragging && !isHoveringBar.current) setIsVisible(false);
+            if (!isDragging && !isHoveringBar.current) {
+                setIsVisible(false);
+                setControlsVisible(false);
+            }
         }, 1500);
-    }, [isDragging]);
+    }, [isDragging, setControlsVisible]);
 
     const keepVisible = () => {
         isHoveringBar.current = true;
         setIsVisible(true);
+        setControlsVisible(true);
         if (hideTimer.current) clearTimeout(hideTimer.current);
     };
 
@@ -67,10 +72,18 @@ export const ControlBar: React.FC<ControlBarProps> = ({ videoRef, onOpenSettings
 
     useEffect(() => {
         const handleMouseMove = (e: MouseEvent) => {
-            // Ignore mouse movement if it's over the opened sidebar (right 320px)
-            if (useSettingsStore.getState().sidebarOpen && e.clientX > window.innerWidth - 320) {
+            // Determine if mouse is over the right sidebar area
+            const isOverSidebar = useSettingsStore.getState().sidebarOpen && e.clientX > window.innerWidth - 330; // 320px + 10px buffer
+
+            // Only show the bar if:
+            // 1. Not over the sidebar
+            // 2. OR the mouse is explicitly in the bottom part of the screen where the controls are (bottom 20%)
+            const isAtBottom = e.clientY > window.innerHeight * 0.8;
+
+            if (isOverSidebar && !isAtBottom) {
                 return;
             }
+
             showBar();
         };
         window.addEventListener('mousemove', handleMouseMove);
@@ -84,12 +97,14 @@ export const ControlBar: React.FC<ControlBarProps> = ({ videoRef, onOpenSettings
     useEffect(() => {
         if (!isPlaying) {
             setIsVisible(true);
+            setControlsVisible(true);
             if (hideTimer.current) clearTimeout(hideTimer.current);
         } else {
             // 当进入播放状态时，立刻强制使控制栏收起，给予沉浸感
             setIsVisible(false);
+            setControlsVisible(false);
         }
-    }, [isPlaying]);
+    }, [isPlaying, setControlsVisible]);
 
     // Volume hover with delay
     const handleVolumeEnter = () => {
@@ -561,21 +576,55 @@ export const ControlBar: React.FC<ControlBarProps> = ({ videoRef, onOpenSettings
                                                                 <Languages className="w-4 h-4 opacity-70" /> AI智能翻译本地字幕
                                                             </button>
                                                             <button
-                                                                onClick={(e) => {
+                                                                onClick={async (e) => {
                                                                     e.stopPropagation();
                                                                     const modelId = useSettingsStore.getState().selectedModelId;
-                                                                    const fakeId = 'ai-' + Date.now();
-                                                                    addSubtitleToVideo(activeVideo.id, {
-                                                                        id: fakeId,
-                                                                        name: `AI 字幕 (${modelId})`,
-                                                                        type: 'ai',
-                                                                        modelId: modelId
-                                                                    });
-                                                                    setActiveSubtitleId(activeVideo.id, fakeId);
+                                                                    const targetLang = useSettingsStore.getState().targetLanguage || 'auto';
+                                                                    
+                                                                    const existingTrack = activeVideo.subtitles?.find(s => s.type === 'ai' && s.modelId === modelId);
+                                                                    const trackId = existingTrack ? existingTrack.id : ('ai-' + Date.now());
+
+                                                                    const getAiSrtPath = (videoPath: string, mId: string, tLang: string) => {
+                                                                        const sep = videoPath.includes('\\') ? '\\' : '/';
+                                                                        const lastSlash = videoPath.lastIndexOf(sep);
+                                                                        const dir = videoPath.substring(0, lastSlash);
+                                                                        const nameExt = videoPath.substring(lastSlash + 1);
+                                                                        const lastDot = nameExt.lastIndexOf('.');
+                                                                        const name = lastDot !== -1 ? nameExt.substring(0, lastDot) : nameExt;
+                                                                        const safeModelId = mId.replace(/[\/\\:*?"<>|]/g, '-');
+                                                                        return `${dir}${sep}${name}.${tLang}-AI-${safeModelId}.srt`;
+                                                                    };
+                                                                    const expectedSrtPath = existingTrack?.path || getAiSrtPath(activeVideo.path, modelId, targetLang);
+
+                                                                    let resumeOffset = 0;
+                                                                    const subStore = useSubtitleStore.getState();
+                                                                    if (existingTrack) {
+                                                                        try {
+                                                                            const fileCues = await parseSrt(expectedSrtPath, trackId);
+                                                                            if (fileCues && fileCues.length > 0) {
+                                                                                resumeOffset = fileCues[fileCues.length - 1].endTime;
+                                                                                subStore.setCues(fileCues);
+                                                                            }
+                                                                        } catch(err) {
+                                                                            subStore.clearCues();
+                                                                        }
+                                                                    }
+
+                                                                    if (!existingTrack || !existingTrack.path) {
+                                                                        addSubtitleToVideo(activeVideo.id, {
+                                                                            id: trackId,
+                                                                            name: `AI 字幕 (${modelId})`,
+                                                                            type: 'ai',
+                                                                            modelId: modelId,
+                                                                            path: expectedSrtPath
+                                                                        });
+                                                                    }
+
+                                                                    setActiveSubtitleId(activeVideo.id, trackId);
                                                                     if (!subtitleVisible) toggleSubtitle();
 
                                                                     // 开始真实的 WebSocket 流式转录
-                                                                    subtitleClient.generate(activeVideo.id, activeVideo.path, fakeId);
+                                                                    subtitleClient.generate(activeVideo.id, activeVideo.path, trackId, resumeOffset);
                                                                 }}
                                                                 className={`w-full px-3 py-2 text-left text-sm rounded-lg flex items-center gap-2 transition-colors ${theme === 'light' ? 'hover:bg-black/5 text-slate-700' : 'hover:bg-white/5 text-white/90'}`}
                                                             >

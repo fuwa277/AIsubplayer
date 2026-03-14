@@ -1,9 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Clock, Search, Edit3, Check, X, Download } from 'lucide-react';
+import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
+import { Clock, Search, Edit3, Check, X, Download, RefreshCw } from 'lucide-react';
 import { useSubtitleStore, SubtitleCue } from '../stores/subtitleStore';
 import { usePlayerStore } from '../stores/playerStore';
 import { useQueueStore } from '../stores/queueStore';
+import { useSettingsStore } from '../stores/settingsStore';
 import { formatTime } from '../utils';
 import { save } from '@tauri-apps/plugin-dialog';
 import { writeSrt } from '../services/srtParser';
@@ -17,19 +19,73 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
     const { currentTime } = usePlayerStore();
     const [searchQuery, setSearchQuery] = useState('');
     const [editingId, setEditingId] = useState<string | number | null>(null);
+    const [reidentifyingId, setReidentifyingId] = useState<string | number | null>(null);
     const [editText, setEditText] = useState('');
-    const activeRef = useRef<HTMLDivElement>(null);
+    const virtuosoRef = useRef<VirtuosoHandle>(null);
 
-    // Auto-scroll to active subtitle
+    // Auto-scroll to active subtitle using Virtual List
     useEffect(() => {
-        if (activeRef.current) {
-            activeRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        if (isGenerating || filteredCues.length === 0) return;
+        const activeIndex = filteredCues.findIndex(c => currentTime >= c.startTime && currentTime <= c.endTime);
+        if (activeIndex !== -1 && virtuosoRef.current) {
+            virtuosoRef.current.scrollToIndex({
+                index: activeIndex,
+                align: 'center',
+                behavior: 'smooth'
+            });
         }
-    }, [currentTime]);
+    }, [currentTime, isGenerating]);
 
     const handleJumpTo = (time: number) => {
         if (videoRef.current) {
             videoRef.current.currentTime = time;
+        }
+    };
+
+    const handleReidentify = async (cue: SubtitleCue) => {
+        const settings = useSettingsStore.getState();
+        const activeVideo = useQueueStore.getState().getActiveVideo();
+        if (!activeVideo) return;
+
+        setReidentifyingId(cue.id);
+        try {
+            const res = await fetch(`http://127.0.0.1:${settings.backendPort}/api/reidentify`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    video_path: activeVideo.path,
+                    start_time: cue.startTime,
+                    end_time: cue.endTime,
+                    model_id: settings.selectedModelId,
+                    inference_device: settings.inferenceDevice,
+                    compute_type: settings.computeType,
+                    source_language: settings.sourceLanguage,
+                    target_language: settings.targetLanguage
+                })
+            });
+            const data = await res.json();
+            if (data.text) {
+                // Update the cue in the store
+                useSubtitleStore.getState().updateCue(cue.id, data.text, data.original_text || cue.originalText);
+
+                // 强制保存物理文件（因为此时未处于手写编辑态，直接调 handleSaveEdit 会因 editingId 为 null 而被拦截拦截，导致无法落盘）
+                setTimeout(async () => {
+                    const updatedCues = useSubtitleStore.getState().cues;
+                    if (activeVideo && activeVideo.activeSubtitleId) {
+                        const activeTrack = activeVideo.subtitles?.find(s => s.id === activeVideo.activeSubtitleId);
+                        if (activeTrack && activeTrack.path) {
+                            try {
+                                await writeSrt(activeTrack.path, updatedCues);
+                                console.log("[前端探针] 单句重新识别结果已安全落盘:", activeTrack.path);
+                            } catch (e) { console.error("Auto-save failed after reidentify:", e); }
+                        }
+                    }
+                }, 100);
+            }
+        } catch (e) {
+            console.error("Re-identify failed:", e);
+        } finally {
+            setReidentifyingId(null);
         }
     };
 
@@ -43,7 +99,7 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
             splitAndUpdateCue(editingId, editText);
             setEditingId(null);
             setEditText('');
-            
+
             // 延迟以确保 Zustand 的 state 已经更新完成，然后覆写物理文件
             setTimeout(async () => {
                 const updatedCues = useSubtitleStore.getState().cues;
@@ -53,7 +109,7 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
                     if (activeTrack && activeTrack.path) {
                         try {
                             await writeSrt(activeTrack.path, updatedCues);
-                        } catch(e) { console.error("Auto-save failed:", e); }
+                        } catch (e) { console.error("Auto-save failed:", e); }
                     }
                 }
             }, 100);
@@ -128,7 +184,7 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
             </div>
 
             {/* Cue list */}
-            <div className="flex-1 overflow-y-auto queue-scroll">
+            <div className="flex-1 overflow-hidden" style={{ height: '100%', minHeight: 0 }}>
                 {filteredCues.length === 0 ? (
                     <div className="flex flex-col items-center justify-center h-full text-[var(--color-text-secondary)] px-4">
                         <Clock className="w-10 h-10 mb-3 opacity-30" />
@@ -140,18 +196,19 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
                         </p>
                     </div>
                 ) : (
-                    <div className="py-1">
-                        {filteredCues.map((cue) => {
+                    <Virtuoso
+                        ref={virtuosoRef}
+                        style={{ height: '100%' }}
+                        data={filteredCues}
+                        itemContent={(_, cue) => {
                             const isActive = currentTime >= cue.startTime && currentTime <= cue.endTime;
                             const isEditing = editingId === cue.id;
 
                             return (
                                 <div
-                                    key={cue.id}
-                                    ref={isActive ? activeRef : undefined}
                                     onClick={() => !isEditing && handleJumpTo(cue.startTime)}
                                     onDoubleClick={() => handleStartEdit(cue)}
-                                    className={`px-3 py-1.5 mx-1 rounded-lg cursor-pointer transition-all text-sm ${isActive
+                                    className={`group px-3 py-1.5 mx-1 my-0.5 rounded-lg cursor-pointer transition-all text-sm ${isActive
                                         ? 'bg-[var(--color-accent)]/12 border-l-2 border-[var(--color-accent)]'
                                         : 'hover:bg-[var(--color-bg-tertiary)]/60 border-l-2 border-transparent'
                                         }`}
@@ -163,12 +220,23 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
                                             {formatTime(cue.startTime)} → {formatTime(cue.endTime)}
                                         </span>
                                         {!isEditing && (
-                                            <button
-                                                onClick={(e) => { e.stopPropagation(); handleStartEdit(cue); }}
-                                                className="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:text-[var(--color-accent)] text-[var(--color-text-secondary)] transition-all"
-                                            >
-                                                <Edit3 className="w-2.5 h-2.5" />
-                                            </button>
+                                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                                                <button
+                                                    onClick={(e) => { e.stopPropagation(); handleStartEdit(cue); }}
+                                                    title="编辑"
+                                                    className="p-0.5 rounded hover:text-[var(--color-accent)] text-[var(--color-text-secondary)]"
+                                                >
+                                                    <Edit3 className="w-2.5 h-2.5" />
+                                                </button>
+                                                <button
+                                                    onClick={(e) => { e.stopPropagation(); handleReidentify(cue); }}
+                                                    title="重新 AI 识别该段"
+                                                    disabled={reidentifyingId === cue.id}
+                                                    className={`p-0.5 rounded hover:text-[var(--color-accent)] text-[var(--color-text-secondary)] ${reidentifyingId === cue.id ? 'animate-spin' : ''}`}
+                                                >
+                                                    <RefreshCw className="w-2.5 h-2.5" />
+                                                </button>
+                                            </div>
                                         )}
                                     </div>
 
@@ -219,8 +287,8 @@ export const SubtitleTimeline: React.FC<SubtitleTimelineProps> = ({ videoRef }) 
                                     )}
                                 </div>
                             );
-                        })}
-                    </div>
+                        }}
+                    />
                 )}
             </div>
 

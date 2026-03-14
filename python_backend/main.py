@@ -1,9 +1,60 @@
 import os
 import sys
+import io
+
+# 修复 PyInstaller 在 --noconsole 模式下 sys.stdout 为 None 导致 uvicorn 崩溃的问题
+if getattr(sys, 'stdout', None) is None:
+    sys.stdout = io.StringIO()
+if getattr(sys, 'stderr', None) is None:
+    sys.stderr = io.StringIO()
+
+# ================= 读取自定义模型路径与缓存配置 =================
+import json
+import sys
+
+# 1. 自动定位当前运行目录并注入 sys.path (终极物理映射法)
+if getattr(sys, 'frozen', False):
+    app_path = os.path.abspath(os.path.dirname(sys.executable))
+    # 强制将 exe 所在目录加入环境变量，让程序直接读取旁边的物理代码文件夹
+    if app_path not in sys.path:
+        sys.path.insert(0, app_path)
+else:
+    app_path = os.getcwd()
+
+custom_base_dir = os.path.join(app_path, '.aisubplayer_data')
+
+# 2. 权限探测与智能回退机制 (兼容绿色版和 C:\Program Files 安装版)
+try:
+    os.makedirs(custom_base_dir, exist_ok=True)
+    # 尝试写入一个隐藏的测试文件，验证是否真的有写入权限
+    _test_file = os.path.join(custom_base_dir, '.write_test')
+    with open(_test_file, 'w') as f:
+        f.write('ok')
+    os.remove(_test_file)
+except (PermissionError, OSError):
+    # 如果没有权限（例如被安装到了 C:\Program Files），则回退到当前用户的个人文件夹
+    # 路径通常为：C:\Users\用户名\.aisubplayer_data
+    fallback_path = os.path.expanduser('~')
+    custom_base_dir = os.path.join(fallback_path, '.aisubplayer_data')
+    os.makedirs(custom_base_dir, exist_ok=True)
+
+# 设置全局环境变量，后续所有模块都会自动读取这个最终安全的路径
+os.environ['AISUBPLAYER_BASE_DIR'] = custom_base_dir
+os.environ['HF_HOME'] = os.path.join(custom_base_dir, 'hf_cache')
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+
+# 强制控制台使用 UTF-8 输出，解决日志里的中文视觉乱码
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+# ========================================================
 
 # ================= 优先挂载外部 CUDA 运行库 =================
 # CTranslate2 / Faster-Whisper 等底层依赖需要 cublas 和 cudnn DLL 文件
-cuda_engine_dir = os.path.join(os.path.expanduser('~/.aisubplayer'), 'models', 'cuda_engine')
+# 修复：指向新的绿色便携目录，正确加载显卡加速核心
+cuda_engine_dir = os.path.join(custom_base_dir, 'models', 'cuda_engine')
 if os.path.exists(cuda_engine_dir):
     os.environ['PATH'] = cuda_engine_dir + os.pathsep + os.environ.get('PATH', '')
     try:
@@ -76,18 +127,33 @@ def read_root():
 
 def kill_old_backend_on_port(port: int):
     """强制释放端口上的旧 backend 进程，确保使用固定端口"""
+    import subprocess
     try:
-        for conn in psutil.net_connections(kind='inet'):
-            if conn.laddr.port == port and conn.pid and conn.pid != os.getpid():
-                try:
-                    proc = psutil.Process(conn.pid)
-                    # 只杀同名进程，避免误杀系统进程
-                    if 'aisubplayer' in proc.name().lower() or 'python' in proc.name().lower():
-                        print(f"[AISubPlayer] Killing old backend on port {port}, PID={conn.pid}", flush=True)
-                        proc.kill()
-                        time.sleep(0.5)
-                except Exception:
-                    pass
+        if os.name == 'nt':
+            out = subprocess.check_output(f"netstat -ano | findstr :{port}", shell=True, text=True)
+            for line in out.strip().split('\n'):
+                if 'LISTENING' in line:
+                    pid = int(line.strip().split()[-1])
+                    if pid and pid != os.getpid():
+                        try:
+                            proc = psutil.Process(pid)
+                            if 'aisubplayer' in proc.name().lower() or 'python' in proc.name().lower():
+                                print(f"[AISubPlayer] Killing old backend on port {port}, PID={pid}", flush=True)
+                                proc.kill()
+                                time.sleep(0.5)
+                        except Exception:
+                            pass
+        else:
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.laddr.port == port and conn.pid and conn.pid != os.getpid():
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        if 'aisubplayer' in proc.name().lower() or 'python' in proc.name().lower():
+                            print(f"[AISubPlayer] Killing old backend on port {port}, PID={conn.pid}", flush=True)
+                            proc.kill()
+                            time.sleep(0.5)
+                    except Exception:
+                        pass
     except Exception:
         pass
 

@@ -5,6 +5,7 @@ import { useSubtitleStore } from '../stores/subtitleStore';
 import { parseSrt } from '../services/srtParser';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Pause } from 'lucide-react';
+import { readDir } from '@tauri-apps/plugin-fs';
 
 interface VideoPlayerProps {
     videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -107,7 +108,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoRef }) => {
         const loadSubtitles = async () => {
             const subStore = useSubtitleStore.getState();
 
-            if (!activeVideo || !activeVideo.activeSubtitleId) {
+            if (!activeVideo) {
                 subStore.clearCues();
                 return;
             }
@@ -117,33 +118,83 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoRef }) => {
                 return;
             }
 
-            const activeTrack = activeVideo.subtitles?.find(s => s.id === activeVideo.activeSubtitleId);
-            if (activeTrack && activeTrack.path) {
+            let targetSrtPath: string | null = null;
+            let currentTrackId = activeVideo.activeSubtitleId || `auto-${activeVideo.id}`;
+
+            // 1. 优先尝试加载用户明确选中的字幕轨道
+            if (activeVideo.activeSubtitleId) {
+                const activeTrack = activeVideo.subtitles?.find(s => s.id === activeVideo.activeSubtitleId);
+                if (activeTrack && activeTrack.path) {
+                    targetSrtPath = activeTrack.path;
+                }
+            }
+
+            // 2. 如果没有显式激活的字幕，尝试智能探测后台自动生成的 SRT 文件
+            if (!targetSrtPath && activeVideo.path) {
+                console.log("[前端探针] 开始探测本地字幕，视频路径:", activeVideo.path);
                 try {
-                    const cues = await parseSrt(activeTrack.path, activeTrack.id);
+                    // 安全分离目录和文件名
+                    const lastSlashIndex = Math.max(activeVideo.path.lastIndexOf('/'), activeVideo.path.lastIndexOf('\\'));
+                    const dirPath = lastSlashIndex >= 0 ? activeVideo.path.substring(0, lastSlashIndex) : '';
+                    const fileName = lastSlashIndex >= 0 ? activeVideo.path.substring(lastSlashIndex + 1) : activeVideo.path;
+                    const baseName = fileName.replace(/\.[^/.]+$/, ""); // 例如 "04.头骨结构"
+
+                    console.log("[前端探针] 解析目录:", dirPath, "| 基础文件名:", baseName);
+
+                    if (dirPath) {
+                        const entries = await readDir(dirPath);
+                        console.log(`[前端探针] 读取目录成功，共扫描到 ${entries.length} 个文件`);
+                        
+                        // 模糊匹配：只要是以该视频名开头，且是 .srt 结尾的，一律抓取回来，无视模型和语言代号
+                        const srtEntry = entries.find(e => {
+                            if (!e.name) return false;
+                            const isMatch = e.name.startsWith(baseName) && e.name.endsWith('.srt');
+                            if (isMatch) console.log(`[前端探针] 找到潜在匹配项: ${e.name}`);
+                            return isMatch;
+                        });
+
+                        if (srtEntry) {
+                            targetSrtPath = `${dirPath}/${srtEntry.name}`;
+                            console.log("[前端探针] 最终决定加载目标字幕文件:", targetSrtPath);
+                        } else {
+                            console.log("[前端探针] 目录中未找到任何匹配的 .srt 文件");
+                        }
+                    }
+                } catch (err) {
+                    console.error("[前端探针] 探测本地字幕目录失败:", err);
+                }
+            }
+
+            if (targetSrtPath) {
+                console.log("[前端探针] 准备调用 parseSrt 解析文件:", targetSrtPath);
+                try {
+                    const cues = await parseSrt(targetSrtPath, currentTrackId);
+                    console.log(`[前端探针] parseSrt 解析成功，共获得字幕条数: ${cues.length}`);
                     subStore.setCues(cues);
                 } catch (e) {
-                    console.error("Failed to load subtitle from disk:", e);
+                    console.error("[前端探针] parseSrt 解析字幕文件失败:", e);
                     // 自动卸载已经不存在或损坏的字幕轨道
-                    const qStore = useQueueStore.getState();
-                    const queues = qStore.queues.map(q => ({
-                        ...q,
-                        items: q.items.map(v => {
-                            if (v.id === activeVideo.id) {
-                                const remainingSubs = v.subtitles?.filter(s => s.id !== activeTrack.id) || [];
-                                return {
-                                    ...v,
-                                    subtitles: remainingSubs,
-                                    activeSubtitleId: remainingSubs.length > 0 ? remainingSubs[0].id : null,
-                                    subtitleStatus: 'none' as const,
-                                    subtitleProgress: 0,
-                                    subtitleStatusMsg: undefined
-                                };
-                            }
-                            return v;
-                        })
-                    }));
-                    useQueueStore.setState({ queues });
+                    if (activeVideo.activeSubtitleId) {
+                        const qStore = useQueueStore.getState();
+                        const queues = qStore.queues.map(q => ({
+                            ...q,
+                            items: q.items.map(v => {
+                                if (v.id === activeVideo.id) {
+                                    const remainingSubs = v.subtitles?.filter(s => s.id !== activeVideo.activeSubtitleId) || [];
+                                    return {
+                                        ...v,
+                                        subtitles: remainingSubs,
+                                        activeSubtitleId: remainingSubs.length > 0 ? remainingSubs[0].id : null,
+                                        subtitleStatus: 'none' as const,
+                                        subtitleProgress: 0,
+                                        subtitleStatusMsg: undefined
+                                    };
+                                }
+                                return v;
+                            })
+                        }));
+                        useQueueStore.setState({ queues });
+                    }
                     subStore.clearCues();
                 }
             } else {
@@ -151,7 +202,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoRef }) => {
             }
         };
         loadSubtitles();
-    }, [activeVideo?.id, activeVideo?.activeSubtitleId, activeVideo?.subtitleStatus]);
+    }, [activeVideo?.id, activeVideo?.activeSubtitleId, activeVideo?.subtitleStatus, activeVideo?.path]);
 
     // Load video source
     useEffect(() => {

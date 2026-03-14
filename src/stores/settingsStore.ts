@@ -146,6 +146,7 @@ const defaults = {
         { id: 'medium', name: 'Medium', size: '1.42 GB', downloaded: false, downloading: false, downloadProgress: 0 },
         { id: 'large-v3', name: 'Large V3', size: '2.87 GB', downloaded: false, downloading: false, downloadProgress: 0 },
         { id: 'large-v3-turbo', name: 'Large V3 Turbo', size: '1.58 GB', downloaded: false, downloading: false, downloadProgress: 0 },
+        { id: 'nllb-600m', name: 'NLLB 200 (用于互译)', size: '2.4 GB', downloaded: false, downloading: false, downloadProgress: 0 },
     ],
     batchSize: 32,
     batchLength: 30,

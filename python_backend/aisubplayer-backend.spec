@@ -1,9 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['uvicorn', 'fastapi', 'faster_whisper', 'ctranslate2', 'websockets', 'pydantic']
+hiddenimports = ['uvicorn', 'fastapi', 'faster_whisper', 'ctranslate2', 'websockets', 'pydantic', 'pynvml', 'transformers', 'api.routes', 'services.asr_service', 'services.model_manager', 'services.system_monitor', 'services.translation_service', 'services.vad_service', 'services.vocal_isolation', 'models.schemas']
+hiddenimports += collect_submodules('api')
+hiddenimports += collect_submodules('services')
+hiddenimports += collect_submodules('models')
 tmp_ret = collect_all('faster_whisper')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('ctranslate2')
@@ -34,20 +38,26 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='aisubplayer-backend',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='aisubplayer-backend',
 )

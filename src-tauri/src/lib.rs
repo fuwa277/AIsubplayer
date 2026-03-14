@@ -39,43 +39,25 @@ pub fn run() {
             let tauri_pid = std::process::id();
             let app_handle = app.handle().clone();
 
-            // Spawn sidecar immediately – no artificial delay now that port is pre-cleared
+            // 使用原生 Rust 进程启动代替 Tauri Sidecar
             tauri::async_runtime::spawn(async move {
-                let sidecar_command = app_handle
-                    .shell()
-                    .sidecar("aisubplayer-backend")
-                    .expect("failed to create sidecar command")
-                    .args(["--parent-pid", &tauri_pid.to_string()]);
+                #[cfg(target_os = "windows")]
+                use std::os::windows::process::CommandExt;
 
-                let (mut rx, child) = match sidecar_command.spawn() {
-                    Ok(v) => v,
+                let mut cmd = std::process::Command::new("./aisubplayer-backend/aisubplayer-backend.exe");
+                cmd.args(["--parent-pid", &tauri_pid.to_string()]);
+
+                #[cfg(target_os = "windows")]
+                cmd.creation_flags(0x08000000); // 隐藏黑框
+
+                match cmd.spawn() {
+                    Ok(_) => {
+                        println!("[Backend] 成功通过原生方式拉起外部后端！");
+                        let _ = app_handle.emit("backend-log", "✅ 后端已成功启动！(原生模式下不再捕获详细日志以节省性能)".to_string());
+                    }
                     Err(e) => {
                         eprintln!("[Backend] Failed to spawn: {}", e);
-                        return;
-                    }
-                };
-                let _child = child;
-
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        CommandEvent::Stdout(line) => {
-                            let msg = String::from_utf8_lossy(&line).to_string();
-                            println!("[Backend] {}", msg);
-                            let _ = app_handle.emit("backend-log", msg);
-                        }
-                        CommandEvent::Stderr(line) => {
-                            let msg = String::from_utf8_lossy(&line).to_string();
-                            eprintln!("[Backend Warn] {}", msg);
-                            let _ = app_handle.emit("backend-log", msg);
-                        }
-                        CommandEvent::Error(err) => {
-                            eprintln!("[Backend Crash] {}", err);
-                        }
-                        CommandEvent::Terminated(payload) => {
-                            println!("[Backend Terminated] {:?}", payload);
-                            let _ = app_handle.emit("backend-crashed", format!("{:?}", payload));
-                        }
-                        _ => {}
+                        let _ = app_handle.emit("backend-log", format!("❌ 启动后端失败，请检查 aisubplayer-backend 文件夹是否和主程序在同一目录: {}", e));
                     }
                 }
             });

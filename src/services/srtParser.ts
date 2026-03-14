@@ -63,6 +63,51 @@ export async function parseSrt(path: string, trackId?: string): Promise<Subtitle
             }
         }
     });
+    
+    // 第一道防线：静默自愈（容错解析）
+    // 过滤掉因为断电或中途强杀进程导致的只有 startTime 但没有有效 endTime (或时间错乱) 的残缺块
+    const validCues = cues.filter(c => c.endTime > c.startTime);
 
-    return cues;
+    return validCues;
 }
+
+export const readSrt = async (path: string): Promise<any[]> => {
+    try {
+        const content = await readTextFile(path);
+        // 统一换行符并根据空行分割每个字幕块
+        const blocks = content.replace(/\r\n/g, '\n').trim().split('\n\n');
+        
+        return blocks.map(block => {
+            const lines = block.split('\n');
+            const id = lines[0];
+            const timeStr = lines[1] || '';
+            const textLines = lines.slice(2);
+            
+            const [startStr, endStr] = timeStr.split(' --> ');
+            
+            // 将 SRT 的时间戳 (00:00:00,000) 转换为秒数
+            const parseTime = (str: string) => {
+                if (!str) return 0;
+                const parts = str.split(':');
+                if (parts.length !== 3) return 0;
+                const h = parseInt(parts[0], 10);
+                const m = parseInt(parts[1], 10);
+                const sParts = parts[2].split(',');
+                const s = parseInt(sParts[0], 10);
+                const ms = parseInt(sParts[1] || '0', 10);
+                return h * 3600 + m * 60 + s + ms / 1000;
+            };
+            
+            return {
+                id,
+                startTime: parseTime(startStr),
+                endTime: parseTime(endStr),
+                text: textLines[0] || '',
+                originalText: textLines.length > 1 ? textLines.slice(1).join('\n') : undefined
+            };
+        });
+    } catch (error) {
+        console.error("读取 SRT 文件失败:", error);
+        throw error;
+    }
+};

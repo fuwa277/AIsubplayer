@@ -192,10 +192,15 @@ const GeneralSettings = ({ draft, onChange }: { draft: any, onChange: (k: string
                         onChange={(e) => onChange('sourceLanguage', e.target.value)}
                         options={[
                             { value: 'auto', label: '自动检测 (Auto)' },
+                            { value: 'zh', label: '中文 (Chinese)' },
                             { value: 'en', label: '英语 (English)' },
                             { value: 'ja', label: '日语 (Japanese)' },
-                            { value: 'zh', label: '中文 (Chinese)' },
                             { value: 'ko', label: '韩语 (Korean)' },
+                            { value: 'fr', label: '法语 (French)' },
+                            { value: 'de', label: '德语 (German)' },
+                            { value: 'es', label: '西班牙语 (Spanish)' },
+                            { value: 'ru', label: '俄语 (Russian)' },
+                            { value: 'ar', label: '阿拉伯语 (Arabic)' },
                         ]}
                     />
                     <Select
@@ -203,9 +208,16 @@ const GeneralSettings = ({ draft, onChange }: { draft: any, onChange: (k: string
                         value={draft.targetLanguage}
                         onChange={(e) => onChange('targetLanguage', e.target.value)}
                         options={[
-                            { value: 'zh', label: '简体中文' },
-                            { value: 'en', label: 'English' },
                             { value: 'none', label: '不翻译 (仅提取原文)' },
+                            { value: 'zh', label: '简体中文 (Chinese)' },
+                            { value: 'en', label: '英语 (English)' },
+                            { value: 'ja', label: '日语 (Japanese)' },
+                            { value: 'ko', label: '韩语 (Korean)' },
+                            { value: 'fr', label: '法语 (French)' },
+                            { value: 'de', label: '德语 (German)' },
+                            { value: 'es', label: '西班牙语 (Spanish)' },
+                            { value: 'ru', label: '俄语 (Russian)' },
+                            { value: 'ar', label: '阿拉伯语 (Arabic)' },
                         ]}
                     />
                 </div>
@@ -304,6 +316,33 @@ const GeneralSettings = ({ draft, onChange }: { draft: any, onChange: (k: string
                         onChange={(e) => onChange('backendPort', parseInt(e.target.value) || 8005)}
                         className="w-full px-3 py-2 text-sm rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] outline-none focus:border-[var(--color-accent)]"
                     />
+                </div>
+            </Section>
+            <Section title="数据管理">
+                <div className="space-y-3 px-1">
+                    <div className="flex items-center justify-between p-4 rounded-xl bg-orange-500/5 border border-orange-500/20">
+                        <div>
+                            <h5 className="text-sm font-medium text-orange-400 flex items-center gap-2">
+                                <Trash2 className="w-4 h-4" /> 清理本地模型与缓存
+                            </h5>
+                            <p className="text-[10px] text-[var(--color-text-secondary)] mt-1">这将删除所有已下载的 AI 模型和临时音频文件 (约释放 2-10GB)。</p>
+                        </div>
+                        <button
+                            onClick={async () => {
+                                if (confirm('确定要从磁盘删除所有已下载的模型吗？下次生成字幕前需要重新下载。')) {
+                                    try {
+                                        const store = useSettingsStore.getState();
+                                        // 借用 open_folder 先打开目录让用户确认，后续可改为直接删除接口
+                                        await fetch(`http://127.0.0.1:${store.backendPort}/models/open_folder`, { method: 'POST' });
+                                        alert('已准备好清理。请在打开的文件夹窗口中删除所有子目录以手动清理，或在卸载软件时选择“清理数据”选项。');
+                                    } catch (e) { }
+                                }
+                            }}
+                            className="px-4 py-2 text-xs font-medium rounded-lg bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 transition-all border border-orange-500/20"
+                        >
+                            去清理...
+                        </button>
+                    </div>
                 </div>
             </Section>
         </div>
@@ -570,97 +609,55 @@ const ModelSettings = ({ draft, onChange }: { draft: any, onChange: (k: string, 
                 </div>
             </div>
 
-            <div className="space-y-3">
-                {store.availableModels.map(model => (
-                    <div
-                        key={model.id}
-                        onClick={() => {
-                            store.setSelectedModelId(model.id);
-                            onChange('selectedModelId', model.id);
-                        }}
-                        className={`p-4 rounded-xl border transition-all flex items-center justify-between cursor-pointer select-none ${draft.selectedModelId === model.id
-                            ? 'bg-[var(--color-accent)]/10 border-[var(--color-accent)]/50 ring-1 ring-[var(--color-accent)]/30'
-                            : 'bg-[var(--color-bg-secondary)] border-[var(--color-border)] hover:border-[var(--color-accent)]/40 hover:bg-[var(--color-bg-tertiary)]/40'
-                            }`}
-                    >
-                        <div>
-                            <div className="flex items-center gap-2 mb-1">
-                                <span className="font-medium">{model.name}</span>
-                                {draft.selectedModelId === model.id && (
-                                    <span className={`px-1.5 py-0.5 rounded text-[10px] text-white ${model.downloaded ? 'bg-[var(--color-accent)]' : 'bg-amber-500'
-                                        }`}>
-                                        {model.downloaded ? '当前选中' : '已选中 (待下载)'}
-                                    </span>
-                                )}
-                            </div>
-                            <p className="text-xs text-[var(--color-text-secondary)]">
-                                需下载大小: {model.size} | 显存建议: {
-                                    model.id === 'tiny' ? '2GB+' :
-                                        model.id.includes('large') ? '6GB+' : '4GB+'
-                                }
-                            </p>
-                        </div>
-
-                        <div className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
-                            {model.downloading ? (
-                                <div className="flex flex-col items-end gap-1 w-32">
-                                    <div className="flex justify-between w-full text-[10px] px-1">
-                                        <span className="text-[var(--color-text-secondary)] truncate max-w-[80px]">{model.downloadSpeed || '连接中...'}</span>
-                                        <span className="text-[var(--color-accent)] font-medium font-mono">{Number(model.downloadProgress || 0).toFixed(1)}%</span>
-                                    </div>
-                                    <div className="w-full flex items-center justify-between gap-1.5">
-                                        <div className="flex-1 h-1.5 bg-[var(--color-bg-tertiary)] rounded-full overflow-hidden">
-                                            <div className="h-full bg-[var(--color-accent)] transition-all duration-500" style={{ width: `${model.downloadProgress}%` }} />
-                                        </div>
-                                        <button
-                                            onClick={() => handlePause(model.id)}
-                                            className="p-1 rounded text-[var(--color-text-secondary)] hover:text-white hover:bg-[var(--color-bg-tertiary)] transition-colors flex-shrink-0"
-                                            title="暂停下载"
-                                        >
-                                            <Pause className="w-3.5 h-3.5" />
-                                        </button>
-                                    </div>
-                                </div>
-                            ) : model.downloaded ? (
-                                <>
-                                    <button
-                                        onClick={() => handleDelete(model.id)}
-                                        className="p-2 rounded-lg text-red-400 hover:bg-red-400/10 transition-colors"
-                                        title="卸载模型"
-                                    >
-                                        <Trash2 className="w-4 h-4" />
-                                    </button>
-                                </>
-                            ) : (
-                                <div className="flex items-center gap-1.5">
-                                    {/* 连接测试按钮 */}
-                                    <button
-                                        onClick={() => handleTestConnection(model.id)}
-                                        disabled={store.testingConnections[model.id] === 'testing'}
-                                        className={`p-1.5 rounded-lg border text-xs transition-all ${store.testingConnections[model.id] === 'ok' ? 'border-green-400 text-green-400 bg-green-400/10' :
-                                            store.testingConnections[model.id] === 'fail' ? 'border-red-400 text-red-400 bg-red-400/10' :
-                                                store.testingConnections[model.id] === 'testing' ? 'border-[var(--color-border)] text-[var(--color-text-secondary)] animate-pulse' :
-                                                    'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]'
-                                            }`}
-                                        title={store.testingConnections[model.id] === 'ok' ? '连接正常' : store.testingConnections[model.id] === 'fail' ? '无法连接' : '测试与下载服务器的连接'}
-                                    >
-                                        {store.testingConnections[model.id] === 'ok' ? '✓' :
-                                            store.testingConnections[model.id] === 'fail' ? '✗' :
-                                                store.testingConnections[model.id] === 'testing' ? '...' : '🌐'}
-                                    </button>
-                                    {model.downloadError && <span className="text-[10px] text-red-400 max-w-[60px] truncate" title={model.downloadError}>{model.downloadError}</span>}
-                                    <button
-                                        onClick={() => handleDownload(model.id)}
-                                        className="px-3 py-1.5 text-sm rounded-lg bg-[var(--color-accent)] text-white hover:opacity-90 transition-opacity flex items-center gap-1.5"
-                                    >
-                                        <Download className="w-4 h-4" />
-                                        {model.downloadProgress > 0 && model.downloadProgress < 100 ? '续传' : '下载'}
-                                    </button>
-                                </div>
-                            )}
-                        </div>
+            <div className="space-y-6">
+                <div>
+                    <h4 className="text-sm font-semibold text-[var(--color-text-primary)] mb-3 flex items-center gap-2">
+                        <Cpu className="w-4 h-4 text-[var(--color-accent)]" /> ASR 语音识别模型
+                    </h4>
+                    <div className="space-y-3">
+                        {store.availableModels.filter(m => !m.id.includes('nllb')).map(model => (
+                            <ModelItem
+                                key={model.id}
+                                model={model}
+                                isSelected={draft.selectedModelId === model.id}
+                                onSelect={() => {
+                                    store.setSelectedModelId(model.id);
+                                    onChange('selectedModelId', model.id);
+                                }}
+                                store={store}
+                                handlePause={handlePause}
+                                handleDelete={handleDelete}
+                                handleTestConnection={handleTestConnection}
+                                handleDownload={handleDownload}
+                            />
+                        ))}
                     </div>
-                ))}
+                </div>
+
+                <div className="pt-4 border-t border-[var(--color-border)]">
+                    <h4 className="text-sm font-semibold text-[var(--color-text-primary)] mb-3 flex items-center gap-2">
+                        <Languages className="w-4 h-4 text-emerald-500" /> 离线翻译模型 (NLLB-200)
+                    </h4>
+                    <div className="space-y-3">
+                        {store.availableModels.filter(m => m.id.includes('nllb')).map(model => (
+                            <ModelItem
+                                key={model.id}
+                                model={model}
+                                isSelected={false} // 翻译模型是按需下载，不需要像 ASR 那里点选“当前生效”
+                                hideSelectMark={true}
+                                onSelect={() => { }}
+                                store={store}
+                                handlePause={handlePause}
+                                handleDelete={handleDelete}
+                                handleTestConnection={handleTestConnection}
+                                handleDownload={handleDownload}
+                            />
+                        ))}
+                    </div>
+                    <p className="text-[10px] text-[var(--color-text-secondary)] mt-2 italic px-1">
+                        * 只要下载了 NLLB 模型并开启了“目标翻译语言”，系统在识别后会自动进行翻译。
+                    </p>
+                </div>
             </div>
 
             {/* CUDA Engine Download Section */}
@@ -1012,6 +1009,103 @@ const PerformanceSettings = ({ draft, onChange }: { draft: any, onChange: (k: st
 };
 
 // --- Reusable Form Components ---
+
+const ModelItem = ({
+    model, isSelected, hideSelectMark, onSelect, store,
+    handlePause, handleDelete, handleTestConnection, handleDownload
+}: {
+    model: ASRModel, isSelected: boolean, hideSelectMark?: boolean, onSelect: () => void, store: any,
+    handlePause: (id: string) => void, handleDelete: (id: string) => void,
+    handleTestConnection: (id: string) => void, handleDownload: (id: string) => void
+}) => (
+    <div
+        onClick={onSelect}
+        className={`p-4 rounded-xl border transition-all flex items-center justify-between cursor-pointer select-none ${isSelected
+            ? 'bg-[var(--color-accent)]/10 border-[var(--color-accent)]/50 ring-1 ring-[var(--color-accent)]/30'
+            : 'bg-[var(--color-bg-secondary)] border-[var(--color-border)] hover:border-[var(--color-accent)]/40 hover:bg-[var(--color-bg-tertiary)]/40'
+            }`}
+    >
+        <div className="flex-1 min-w-0 pr-4">
+            <div className="flex items-center gap-2 mb-1">
+                <span className="font-medium truncate">{model.name}</span>
+                {!hideSelectMark && isSelected && (
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] text-white flex-shrink-0 ${model.downloaded ? 'bg-[var(--color-accent)]' : 'bg-amber-500'
+                        }`}>
+                        {model.downloaded ? '当前选中' : '已选中 (待下载)'}
+                    </span>
+                )}
+                {model.downloaded && hideSelectMark && (
+                    <span className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/20 flex-shrink-0">已安装</span>
+                )}
+            </div>
+            <p className="text-xs text-[var(--color-text-secondary)]">
+                需下载大小: {model.size} | 显存建议: {
+                    model.id === 'tiny' ? '2GB+' :
+                        model.id.includes('large') ? '6GB+' :
+                            model.id.includes('nllb') ? '4GB+' : '4GB+'
+                }
+            </p>
+        </div>
+
+        <div className="flex items-center gap-2 flex-shrink-0" onClick={e => e.stopPropagation()}>
+            {model.downloading ? (
+                <div className="flex flex-col items-end gap-1 w-32">
+                    <div className="flex justify-between w-full text-[10px] px-1">
+                        <span className="text-[var(--color-text-secondary)] truncate max-w-[80px]">{model.downloadSpeed || '连接中...'}</span>
+                        <span className="text-[var(--color-accent)] font-medium font-mono">{Number(model.downloadProgress || 0).toFixed(1)}%</span>
+                    </div>
+                    <div className="w-full flex items-center justify-between gap-1.5">
+                        <div className="flex-1 h-1.5 bg-[var(--color-bg-tertiary)] rounded-full overflow-hidden">
+                            <div className="h-full bg-[var(--color-accent)] transition-all duration-500" style={{ width: `${model.downloadProgress}%` }} />
+                        </div>
+                        <button
+                            onClick={() => handlePause(model.id)}
+                            className="p-1 rounded text-[var(--color-text-secondary)] hover:text-white hover:bg-[var(--color-bg-tertiary)] transition-colors flex-shrink-0"
+                            title="暂停下载"
+                        >
+                            <Pause className="w-3.5 h-3.5" />
+                        </button>
+                    </div>
+                </div>
+            ) : model.downloaded ? (
+                <>
+                    <button
+                        onClick={() => handleDelete(model.id)}
+                        className="p-2 rounded-lg text-red-400 hover:bg-red-400/10 transition-colors"
+                        title="卸载模型"
+                    >
+                        <Trash2 className="w-4 h-4" />
+                    </button>
+                </>
+            ) : (
+                <div className="flex items-center gap-1.5">
+                    <button
+                        onClick={() => handleTestConnection(model.id)}
+                        disabled={store.testingConnections[model.id] === 'testing'}
+                        className={`p-1.5 rounded-lg border text-xs transition-all ${store.testingConnections[model.id] === 'ok' ? 'border-green-400 text-green-400 bg-green-400/10' :
+                            store.testingConnections[model.id] === 'fail' ? 'border-red-400 text-red-400 bg-red-400/10' :
+                                store.testingConnections[model.id] === 'testing' ? 'border-[var(--color-border)] text-[var(--color-text-secondary)] animate-pulse' :
+                                    'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]'
+                            }`}
+                        title="测试连接"
+                    >
+                        {store.testingConnections[model.id] === 'ok' ? '✓' :
+                            store.testingConnections[model.id] === 'fail' ? '✗' :
+                                store.testingConnections[model.id] === 'testing' ? '...' : '🌐'}
+                    </button>
+                    {model.downloadError && <span className="text-[10px] text-red-400 max-w-[60px] truncate" title={model.downloadError}>{model.downloadError}</span>}
+                    <button
+                        onClick={() => handleDownload(model.id)}
+                        className="px-3 py-1.5 text-sm rounded-lg bg-[var(--color-accent)] text-white hover:opacity-90 transition-opacity flex items-center gap-1.5"
+                    >
+                        <Download className="w-4 h-4" />
+                        {model.downloadProgress > 0 && model.downloadProgress < 100 ? '续传' : '下载'}
+                    </button>
+                </div>
+            )}
+        </div>
+    </div>
+);
 
 const Section: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
     <div>

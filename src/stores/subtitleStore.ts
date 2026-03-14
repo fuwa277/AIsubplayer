@@ -28,7 +28,9 @@ export interface SubtitleStyle {
 }
 
 export interface SubtitleState {
-    cues: SubtitleCue[];
+    cues: SubtitleCue[]; // 仍然保留供全量导出等场景快速访问
+    cueMap: Record<string | number, SubtitleCue>; // O(1) 字典，用于解决渲染与状态更新灾难
+    cueIds: (string | number)[]; // 顺序 ID 数组
     isVisible: boolean;
     isGenerating: boolean;
     generationProgress: number;
@@ -68,27 +70,52 @@ function loadStyle(): SubtitleStyle {
 
 export const useSubtitleStore = create<SubtitleState>((set, get) => ({
     cues: [],
+    cueMap: {},
+    cueIds: [],
     isVisible: true,
     isGenerating: false,
     generationProgress: 0,
     style: loadStyle(),
 
-    setCues: (cues) => set({ cues }),
-    addCue: (cue) => set((s) => ({ cues: [...s.cues, cue] })),
-    updateCue: (id, text, originalText) => set((s) => ({
-        cues: s.cues.map(c => c.id === id ? { ...c, text, originalText: originalText !== undefined ? originalText : c.originalText } : c),
-    })),
+    setCues: (cues) => {
+        const cueMap: Record<string | number, SubtitleCue> = {};
+        const cueIds = cues.map(c => {
+            cueMap[c.id] = c;
+            return c.id;
+        });
+        set({ cues, cueMap, cueIds });
+    },
+    addCue: (cue) => set((s) => {
+        const nextMap = { ...s.cueMap, [cue.id]: cue };
+        const nextIds = [...s.cueIds, cue.id];
+        return { 
+            cues: [...s.cues, cue], 
+            cueMap: nextMap, 
+            cueIds: nextIds 
+        };
+    }),
+    updateCue: (id, text, originalText) => set((s) => {
+        const cue = s.cueMap[id];
+        if (!cue) return s;
+        // O(1) 直接更新字典对象，彻底摆脱耗时的 map 遍历
+        const updatedCue = { ...cue, text, originalText: originalText !== undefined ? originalText : cue.originalText };
+        const nextMap = { ...s.cueMap, [id]: updatedCue };
+        // 维持 cues 数组用于给其他组件兼容消费
+        const nextCues = s.cueIds.map(cid => nextMap[cid]);
+        return { cueMap: nextMap, cues: nextCues };
+    }),
     splitAndUpdateCue: (id, newText) => set((s) => {
-        const idx = s.cues.findIndex(c => c.id === id);
-        if (idx === -1) return s;
-        const cue = s.cues[idx];
+        const cue = s.cueMap[id];
+        if (!cue) return s;
         const parts = newText.split('\n').map(p => p.trim()).filter(Boolean);
 
         if (parts.length <= 1) {
-            const updatedCues = [...s.cues];
-            updatedCues[idx] = { ...cue, text: newText.trim() };
-            return { cues: updatedCues };
+            const updatedCue = { ...cue, text: newText.trim() };
+            const nextMap = { ...s.cueMap, [id]: updatedCue };
+            return { cueMap: nextMap, cues: s.cueIds.map(cid => nextMap[cid]) };
         }
+        
+        const idx = s.cueIds.indexOf(id);
 
         const newCues: SubtitleCue[] = [];
         const totalChars = parts.reduce((sum, p) => sum + p.length, 0);
@@ -132,9 +159,16 @@ export const useSubtitleStore = create<SubtitleState>((set, get) => ({
             });
         }
 
-        const nextCues = [...s.cues];
-        nextCues.splice(idx, 1, ...newCues);
-        return { cues: nextCues };
+        const nextIds = [...s.cueIds];
+        const newIds = newCues.map(c => c.id);
+        nextIds.splice(idx, 1, ...newIds);
+        
+        const nextMap = { ...s.cueMap };
+        delete nextMap[id]; // 移除老的
+        newCues.forEach(c => nextMap[c.id] = c);
+        
+        const nextCues = nextIds.map(cid => nextMap[cid]);
+        return { cueIds: nextIds, cueMap: nextMap, cues: nextCues };
     }),
     toggleVisible: () => set((s) => ({ isVisible: !s.isVisible })),
     setVisible: (v) => set({ isVisible: v }),
@@ -147,7 +181,7 @@ export const useSubtitleStore = create<SubtitleState>((set, get) => ({
             return { style: next };
         });
     },
-    clearCues: () => set({ cues: [] }),
+    clearCues: () => set({ cues: [], cueMap: {}, cueIds: [] }),
     getCurrentCue: (time) => {
         const { cues } = get();
         return cues.find(c => time >= c.startTime && time <= c.endTime) || null;

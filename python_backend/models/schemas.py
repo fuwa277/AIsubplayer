@@ -30,8 +30,20 @@ class TranscribeRequest(BaseModel):
     word_timestamps: bool = True
     remove_punctuation: bool = False
     resume_offset: float = 0.0
+    target_srt_path: Optional[str] = None
 
 class TranslateTextRequest(BaseModel):
     text: str
     source_language: str
     target_language: str
+
+class ReidentifyRequest(BaseModel):
+    video_path: str
+    start_time: float
+    end_time: float
+    model_id: str
+    inference_device: str = "auto"
+    compute_type: str = "default"
+    source_language: str = "auto"
+    target_language: str = "none"
+

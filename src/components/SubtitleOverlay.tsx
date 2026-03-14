@@ -5,7 +5,7 @@ import { usePlayerStore } from '../stores/playerStore';
 
 export const SubtitleOverlay: React.FC = () => {
     const { cues, isVisible, style } = useSubtitleStore();
-    const { currentTime } = usePlayerStore();
+    const { currentTime, isControlsVisible } = usePlayerStore();
 
     if (!isVisible) return null;
 
@@ -18,7 +18,7 @@ export const SubtitleOverlay: React.FC = () => {
             ? 'top-8'
             : style.position === 'center'
                 ? 'top-1/2 -translate-y-1/2'
-                : 'bottom-20';
+                : isControlsVisible ? 'bottom-32 transition-all duration-300' : 'bottom-16 transition-all duration-300';
 
     return (
         <div
@@ -31,7 +31,7 @@ export const SubtitleOverlay: React.FC = () => {
                         initial={{ opacity: 0, y: 8 }}
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -8 }}
-                        transition={{ duration: 0.2 }}
+                        transition={{ duration: 0.05 }}
                         className="text-center px-4 py-2 rounded-lg max-w-[80%]"
                         style={{
                             backgroundColor: style.bgColor,

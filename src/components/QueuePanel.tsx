@@ -2,7 +2,7 @@ import React, { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
 import {
     Plus, Trash2, Play, Sparkles,
-    FolderPlus, FileText, ChevronDown, X, FolderOpen
+    FolderPlus, FileText, ChevronDown, X, FolderOpen, Pause, Square, RefreshCw
 } from 'lucide-react';
 import { useQueueStore, VideoItem } from '../stores/queueStore';
 import { useSettingsStore } from '../stores/settingsStore';
@@ -13,6 +13,7 @@ import { useLogStore } from '../stores/logStore';
 import { open as tauriOpen } from '@tauri-apps/plugin-dialog';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
+import { parseSrt } from '../services/srtParser';
 
 export const QueuePanel: React.FC = () => {
     const {
@@ -32,6 +33,21 @@ export const QueuePanel: React.FC = () => {
     }
     const [queueCtx, setQueueCtx] = useState<QueueContextMenuData | null>(null);
     const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+
+    // 统一美化的模态框状态 (替换系统原生丑陋弹窗)
+    const [modalConfig, setModalConfig] = useState<{
+        isOpen: boolean;
+        title: string;
+        type: 'input' | 'confirm' | 'file-error';
+        inputValue?: string;
+        message?: string;
+        onConfirm?: (val?: string) => void;
+        onCancel?: () => void;
+        onExtra?: () => void;
+    }>({ isOpen: false, title: '', type: 'confirm' });
+
+    const openModal = (config: Partial<typeof modalConfig>) => setModalConfig(prev => ({ ...prev, ...config, isOpen: true }));
+    const closeModal = () => setModalConfig(prev => ({ ...prev, isOpen: false }));
 
     const handleQueueContextMenu = (e: React.MouseEvent, queueId: string) => {
         e.preventDefault();
@@ -56,10 +72,18 @@ export const QueuePanel: React.FC = () => {
     const handleRenameQueue = () => {
         const queue = queues.find(q => q.id === queueCtx?.queueId);
         if (queueCtx && queue) {
-            const newName = prompt("请输入新队列名称：", queue.name);
-            if (newName && newName.trim()) {
-                useQueueStore.getState().renameQueue(queueCtx.queueId, newName.trim());
-            }
+            openModal({
+                type: 'input',
+                title: '重命名队列',
+                inputValue: queue.name,
+                onConfirm: (newName) => {
+                    if (newName && newName.trim()) {
+                        useQueueStore.getState().renameQueue(queue.id, newName.trim());
+                    }
+                    closeModal();
+                },
+                onCancel: closeModal
+            });
         }
         setQueueCtx(null);
     };
@@ -116,13 +140,42 @@ export const QueuePanel: React.FC = () => {
             }
             store.setActiveSubtitleId(videoId, trackId);
 
-            // 核心：计算断点续传时间
+            // 核心：基于本地文件计算断点续传时间 (文件驱动)
             let resumeOffset = 0;
-            if (existingTrack && subStore.cues.length > 0) {
-                const lastCue = subStore.cues[subStore.cues.length - 1];
-                if (lastCue.id.toString().startsWith(trackId)) {
-                    resumeOffset = lastCue.endTime;
+            const targetLang = settings.targetLanguage || 'auto';
+            const expectedSrtPath = existingTrack?.path || getAiSrtPath(video.path, modelId, targetLang);
+
+            const { exists } = await import('@tauri-apps/plugin-fs');
+            let fileExists = false;
+            try { fileExists = await exists(expectedSrtPath); } catch (e) { }
+
+            if (fileExists) {
+                try {
+                    const fileCues = await parseSrt(expectedSrtPath, trackId);
+                    if (fileCues && fileCues.length > 0) {
+                        resumeOffset = fileCues[fileCues.length - 1].endTime;
+                        if (store.getActiveVideo()?.id === videoId) {
+                            subStore.setCues(fileCues);
+                        }
+                    } else {
+                        // 批量生成时若遇到损坏文件直接重头生成 (后台会先进行安全备份)
+                        resumeOffset = 0;
+                        if (store.getActiveVideo()?.id === videoId) subStore.clearCues();
+                    }
+                } catch (err) {
+                    if (store.getActiveVideo()?.id === videoId) subStore.clearCues();
                 }
+            }
+
+            // 确保存储了正确的文件路径，方便以后直接点播读取
+            if (!existingTrack || !existingTrack.path) {
+                store.addSubtitleToVideo(videoId, {
+                    id: trackId,
+                    name: `AI 字幕 (${modelId})`,
+                    type: 'ai',
+                    modelId: modelId,
+                    path: expectedSrtPath
+                });
             }
 
             // 确保后端就绪后再发起生成（后端启动慢时给用户提示而不是直接报错）
@@ -259,15 +312,32 @@ export const QueuePanel: React.FC = () => {
         }
     };
 
-    const handlePlayVideo = (index: number) => {
+    const handlePlayVideo = async (index: number) => {
         const activeQueue = useQueueStore.getState().queues.find(q => q.id === useQueueStore.getState().activeQueueId);
         const video = activeQueue?.items[index];
+        
         if (video) {
-            // 如果切换的视频正在生成，把后台缓冲池的字幕重新塞给前台 Store，解决失踪问题
+            // 如果切换的视频正在生成，把后台缓冲池的字幕重新塞给前台 Store
             const sessionCues = subtitleClient.getSessionCues(video.id);
             if (sessionCues && sessionCues.length > 0) {
                 useSubtitleStore.getState().setCues(sessionCues);
+            } else {
+                // 修复：读取该视频当前的字幕文件，实现各视频字幕独立显示
+                const activeTrack = video.subtitles?.find(s => s.id === video.activeSubtitleId);
+                if (activeTrack && activeTrack.path) {
+                    try {
+                        const cues = await parseSrt(activeTrack.path, activeTrack.id);
+                        useSubtitleStore.getState().setCues(cues);
+                    } catch (e) {
+                        console.error("Failed to load SRT:", e);
+                        useSubtitleStore.getState().clearCues();
+                    }
+                } else {
+                    useSubtitleStore.getState().clearCues();
+                }
             }
+        } else {
+            useSubtitleStore.getState().clearCues();
         }
         setActiveVideoIndex(index);
     };
@@ -397,6 +467,7 @@ export const QueuePanel: React.FC = () => {
                                         handleDrop();
                                     }}
                                     onDragEnd={handleDragEnd}
+                                    openModal={openModal}
                                 />
                             ))}
                         </div>
@@ -417,11 +488,11 @@ export const QueuePanel: React.FC = () => {
                     <button onClick={handleRenameQueue} className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors text-[var(--color-text-primary)]">重命名队列</button>
                     {isBatchRunning && batchQueueId === queueCtx.queueId ? (
                         <button onClick={handlePauseBatch} className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors text-amber-400 flex items-center gap-2">
-                            <span className="text-xs">⏸</span> 暂停批量生成
+                            <Pause className="w-3.5 h-3.5" /> 暂停批量生成
                         </button>
                     ) : batchQueue.length > 0 && batchQueueId === queueCtx.queueId ? (
                         <button onClick={handleResumeBatch} className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors text-[var(--color-accent)] flex items-center gap-2">
-                            <span className="text-xs">▶</span> 继续批量生成 ({batchQueue.length})
+                            <Play className="w-3.5 h-3.5" /> 继续批量生成 ({batchQueue.length})
                         </button>
                     ) : (
                         <button onClick={handleBatchGenerate} className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors text-[var(--color-accent)]">
@@ -431,6 +502,71 @@ export const QueuePanel: React.FC = () => {
                     <button onClick={handleDeleteQueue} className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors text-red-400">删除当前队列</button>
                 </div>
             )}
+
+            {/* Global Custom Modal: 替代原生 Prompt/Alert */}
+            <AnimatePresence>
+                {modalConfig.isOpen && (
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm pointer-events-auto"
+                        onClick={modalConfig.onCancel}
+                    >
+                        <motion.div
+                            initial={{ scale: 0.95, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0.95, opacity: 0 }}
+                            onClick={e => e.stopPropagation()}
+                            className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl shadow-2xl p-5 w-80 max-w-[90vw] flex flex-col gap-4"
+                        >
+                            <h3 className="text-base font-medium text-[var(--color-text-primary)]">{modalConfig.title}</h3>
+                            
+                            {modalConfig.type === 'input' && (
+                                <input
+                                    autoFocus
+                                    value={modalConfig.inputValue || ''}
+                                    onChange={e => setModalConfig(p => ({ ...p, inputValue: e.target.value }))}
+                                    onKeyDown={e => e.key === 'Enter' && modalConfig.onConfirm?.(modalConfig.inputValue)}
+                                    className="w-full px-3 py-2 text-sm rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] outline-none focus:border-[var(--color-accent)] text-[var(--color-text-primary)]"
+                                    placeholder="请输入..."
+                                />
+                            )}
+                            
+                            {(modalConfig.type === 'confirm' || modalConfig.type === 'file-error') && modalConfig.message && (
+                                <p className="text-sm text-[var(--color-text-secondary)] whitespace-pre-wrap leading-relaxed">
+                                    {modalConfig.message}
+                                </p>
+                            )}
+
+                            <div className="flex flex-col gap-2 mt-2">
+                                {modalConfig.type === 'file-error' ? (
+                                    <>
+                                        <button onClick={() => modalConfig.onConfirm?.()} className="w-full py-2 px-4 rounded-lg bg-[var(--color-accent)] text-white text-sm font-medium hover:opacity-90 transition-opacity flex items-center justify-center gap-2">
+                                            <RefreshCw className="w-4 h-4" /> 覆盖并全新生成
+                                        </button>
+                                        <button onClick={() => modalConfig.onExtra?.()} className="w-full py-2 px-4 rounded-lg bg-[var(--color-bg-tertiary)] text-[var(--color-text-primary)] text-sm font-medium hover:bg-[var(--color-bg-tertiary)]/80 transition-colors flex items-center justify-center gap-2">
+                                            <FolderOpen className="w-4 h-4" /> 打开所在目录检查
+                                        </button>
+                                        <button onClick={modalConfig.onCancel} className="w-full py-2 px-4 rounded-lg border border-[var(--color-border)] text-[var(--color-text-secondary)] text-sm font-medium hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center justify-center gap-2">
+                                            <X className="w-4 h-4" /> 取消本次操作
+                                        </button>
+                                    </>
+                                ) : (
+                                    <div className="flex justify-end gap-2 w-full">
+                                        <button onClick={modalConfig.onCancel} className="px-4 py-1.5 rounded-lg text-sm font-medium text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-tertiary)] transition-colors">
+                                            取消
+                                        </button>
+                                        <button onClick={() => modalConfig.onConfirm?.(modalConfig.inputValue)} className="px-4 py-1.5 rounded-lg text-sm font-medium bg-[var(--color-accent)] text-white hover:opacity-90 transition-opacity">
+                                            确定
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+                        </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
         </div>
     );
 };
@@ -441,6 +577,18 @@ interface ContextMenuData {
     y: number;
     videoId: string;
 }
+
+// 计算 AI 字幕文件存储路径的辅助函数（与 Python 后端保持绝对一致）
+const getAiSrtPath = (videoPath: string, modelId: string, targetLanguage: string = 'auto') => {
+    const separator = videoPath.includes('\\') ? '\\' : '/';
+    const lastSlash = videoPath.lastIndexOf(separator);
+    const dir = videoPath.substring(0, lastSlash);
+    const nameExt = videoPath.substring(lastSlash + 1);
+    const lastDot = nameExt.lastIndexOf('.');
+    const name = lastDot !== -1 ? nameExt.substring(0, lastDot) : nameExt;
+    const safeModelId = modelId.replace(/[\/\\:*?"<>|]/g, '-');
+    return `${dir}${separator}${name}.${targetLanguage}-AI-${safeModelId}.srt`;
+};
 
 // 等待后台唤醒辅助函数
 const waitForBackendHelper = async (): Promise<boolean> => {
@@ -473,7 +621,8 @@ const QueueItem: React.FC<{
     onDragOver: (e: React.DragEvent<HTMLDivElement>) => void;
     onDrop: (e: React.DragEvent<HTMLDivElement>) => void;
     onDragEnd: () => void;
-}> = ({ video, isActive, isDragging, isInBatchQueue, onPlay, onRemove, draggable, onDragStart, onDragEnter, onDragOver, onDrop, onDragEnd }) => {
+    openModal: (config: any) => void;
+}> = ({ video, isActive, isDragging, isInBatchQueue, onPlay, onRemove, draggable, onDragStart, onDragEnter, onDragOver, onDrop, onDragEnd, openModal }) => {
     const [hover, setHover] = useState(false);
     const [contextMenu, setContextMenu] = useState<ContextMenuData | null>(null);
 
@@ -501,18 +650,19 @@ const QueueItem: React.FC<{
         e.stopPropagation();
         setContextMenu(null);
         try {
-            // 【排错诊断代码】
             console.log("====== 准备在文件夹中显示文件 ======");
             console.log("原视频路径:", video.path);
-            
-            // Tauri v2 推荐使用 revealItemInDir 直接打开目录并高亮选中文件
             await revealItemInDir(video.path);
             console.log("命令已成功发送给系统。");
         } catch (err) {
             console.error("====== 打开文件夹失败 ======", err);
-            // 将错误信息直接弹窗显示，避免需要去控制台找
             const errMsg = err instanceof Error ? err.message : (typeof err === 'string' ? err : JSON.stringify(err));
-            alert(`打开目录失败！\n\n目标路径：${video.path}\n\n底层错误原因：\n${errMsg}\n\n（请将此错误截图或复制告诉我）`);
+            openModal({
+                type: 'confirm',
+                title: '打开目录失败',
+                message: `目标路径：${video.path}\n\n底层错误原因：\n${errMsg}`,
+                onConfirm: () => openModal({isOpen: false})
+            });
         }
     };
 
@@ -545,14 +695,65 @@ const QueueItem: React.FC<{
         }
         store.setActiveSubtitleId(video.id, trackId);
 
-        // 核心：计算断点续传时间
+        // 核心：基于本地文件计算断点续传时间 (文件驱动)
         let resumeOffset = 0;
-        if (existingTrack && subStore.cues.length > 0) {
-            const lastCue = subStore.cues[subStore.cues.length - 1];
-            // 只取当前这个轨道的最后一句时间
-            if (lastCue.id.toString().startsWith(trackId)) {
-                resumeOffset = lastCue.endTime;
+        const targetLang = settings.targetLanguage || 'auto';
+        const expectedSrtPath = existingTrack?.path || getAiSrtPath(video.path, modelId, targetLang);
+
+        // 第二道防线：检测文件损坏并交还决策权给用户
+        const { exists } = await import('@tauri-apps/plugin-fs');
+        let fileExists = false;
+        try { fileExists = await exists(expectedSrtPath); } catch (e) { }
+
+        if (fileExists) {
+            try {
+                // 读取真实文件作为唯一事实来源
+                const fileCues = await parseSrt(expectedSrtPath, trackId);
+                if (fileCues && fileCues.length > 0) {
+                    resumeOffset = fileCues[fileCues.length - 1].endTime;
+                    // 同步恢复前端内存状态，保证界面能看到之前生成的字幕
+                    subStore.setCues(fileCues);
+                } else {
+                    // 拦截：文件存在，但内部完全损坏或不合规
+                    store.updateVideoSubtitleStatus(video.id, 'none', 0, '');
+                    setContextMenu(null);
+                    openModal({
+                        type: 'file-error',
+                        title: '发现异常字幕文件',
+                        message: '检测到当前视频已存在同名字幕文件，但内容格式无法识别或已损坏。',
+                        onConfirm: () => {
+                            // 主动选择覆盖
+                            subStore.clearCues();
+                            if (!existingTrack || !existingTrack.path) {
+                                store.addSubtitleToVideo(video.id, { id: trackId, name: `AI 字幕 (${modelId})`, type: 'ai', modelId, path: expectedSrtPath });
+                            }
+                            if (!subStore.isVisible) subStore.toggleVisible();
+                            subtitleClient.generate(video.id, video.path, trackId, 0);
+                            openModal({isOpen: false});
+                        },
+                        onExtra: async () => {
+                            try { await revealItemInDir(expectedSrtPath); } catch (e) { console.error(e); }
+                            openModal({isOpen: false});
+                        },
+                        onCancel: () => openModal({isOpen: false})
+                    });
+                    return; // 终止当前执行
+                }
+            } catch (err) {
+                console.log("读取已有字幕文件失败，将从头开始生成:", err);
+                subStore.clearCues();
             }
+        }
+
+        // 确保存储了正确的文件路径，方便以后直接点播读取
+        if (!existingTrack || !existingTrack.path) {
+            store.addSubtitleToVideo(video.id, {
+                id: trackId,
+                name: `AI 字幕 (${modelId})`,
+                type: 'ai',
+                modelId: modelId,
+                path: expectedSrtPath
+            });
         }
 
         // Auto show subtitles if hidden
@@ -631,6 +832,7 @@ const QueueItem: React.FC<{
                             progress={video.subtitleProgress}
                             msg={video.subtitleStatusMsg}
                             isQueued={isInBatchQueue}
+                            hasSubtitles={!!(video.subtitles && video.subtitles.length > 0)}
                             onCancel={video.subtitleStatus === 'generating' || video.subtitleStatus === 'pending' ? () => {
                                 subtitleClient.stop(video.id);
                                 useQueueStore.getState().updateVideoSubtitleStatus(video.id, 'paused', undefined, '已手动取消');
@@ -682,17 +884,22 @@ const QueueItem: React.FC<{
                     {video.subtitleStatus === 'generating' || video.subtitleStatus === 'pending' ? (
                         <>
                             <button
-                                onClick={(e) => { e.stopPropagation(); subtitleClient.stop(video.id); useQueueStore.getState().updateVideoSubtitleStatus(video.id, 'paused', undefined, '已手动暂停'); setContextMenu(null); }}
+                                onClick={(e) => { 
+                                    e.stopPropagation(); 
+                                    subtitleClient.stop(video.id); 
+                                    useQueueStore.getState().updateVideoSubtitleStatus(video.id, 'paused', undefined, '已手动暂停'); 
+                                    setContextMenu(null);
+                                }}
                                 className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-amber-400"
                             >
-                                <span className="w-4 h-4 flex items-center justify-center text-xs">⏸</span>
+                                <Pause className="w-4 h-4" />
                                 暂停生成任务
                             </button>
                             <button
                                 onClick={(e) => { e.stopPropagation(); subtitleClient.stop(video.id); useQueueStore.getState().updateVideoSubtitleStatus(video.id, 'none', 0, ''); setContextMenu(null); }}
                                 className="w-full text-left px-3 py-2 text-sm hover:bg-[var(--color-bg-tertiary)] transition-colors flex items-center gap-2 text-red-400"
                             >
-                                <span className="w-4 h-4 flex items-center justify-center text-xs">⏹</span>
+                                <Square className="w-4 h-4" />
                                 取消并清空进度
                             </button>
                         </>
@@ -725,24 +932,33 @@ const QueueItem: React.FC<{
     );
 };
 
-const SubtitleStatusBadge: React.FC<{ status: string; progress: number; msg?: string; isQueued?: boolean; onCancel?: () => void }> = ({ status, progress, msg, isQueued, onCancel }) => {
+const SubtitleStatusBadge: React.FC<{ status: string; progress: number; msg?: string; isQueued?: boolean; onCancel?: () => void; hasSubtitles?: boolean }> = ({ status, progress, msg, isQueued, onCancel, hasSubtitles }) => {
     if (isQueued && status !== 'generating' && status !== 'done') {
         return <span className="text-[10px] text-amber-400 flex items-center gap-1"><span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />等待生成</span>;
     }
+    
+    // 优先判断：如果已经有了字幕轨道（本地或已生成好），且当前不在生成中，则显示“已加载字幕”不再报错
+    if (hasSubtitles && status !== 'generating' && status !== 'pending') {
+        return <span className="text-[10px] text-emerald-400">已加载字幕</span>;
+    }
+
     switch (status) {
         case 'generating':
             return (
                 <div className="flex flex-col gap-1 items-start w-full pr-2">
-                    <div className="flex items-center gap-1.5 w-full">
-                        <div className="w-16 h-1 bg-[var(--color-bg-tertiary)] rounded-full overflow-hidden flex-shrink-0">
+                    <div className="flex items-center gap-1.5">
+                        <div className="w-12 h-1 bg-[var(--color-bg-tertiary)] rounded-full overflow-hidden flex-shrink-0">
                             <div
                                 className="h-full bg-[var(--color-accent)] rounded-full transition-all duration-300"
                                 style={{ width: `${progress}%` }}
                             />
                         </div>
-                        <span className="text-[10px] text-[var(--color-accent)]">{progress}%</span>
+                        <span className="text-[10px] text-[var(--color-accent)] min-w-[28px]">{progress}%</span>
                         {onCancel && (
-                            <button onClick={(e) => { e.stopPropagation(); onCancel(); }} className="ml-0.5 p-0.5 rounded text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-tertiary)] hover:text-red-400 transition-colors" title="停止生成">
+                            <button onClick={(e) => { 
+                                e.stopPropagation(); 
+                                onCancel(); 
+                            }} className="p-0.5 -ml-0.5 rounded text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-tertiary)] hover:text-red-400 transition-colors flex-shrink-0" title="暂停/停止">
                                 <X className="w-3 h-3" />
                             </button>
                         )}

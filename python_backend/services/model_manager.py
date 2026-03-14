@@ -59,6 +59,7 @@ class ModelManager:
         "large-v2":       "Systran/faster-whisper-large-v2",
         "large-v3":       "Systran/faster-whisper-large-v3",
         "large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
+        "nllb-600m":      "JustFrederik/nllb-200-distilled-600M-ct2",
     }
 
     def get_repo_id(self, model_id: str) -> str:
@@ -454,5 +455,6 @@ class ModelManager:
             status['downloading'] = False
 
 import os
-base_models_dir = os.path.join(os.path.expanduser('~/.aisubplayer'), 'models')
+base_dir = os.environ.get('AISUBPLAYER_BASE_DIR', os.path.expanduser('~/.aisubplayer'))
+base_models_dir = os.path.join(base_dir, 'models')
 model_manager = ModelManager(base_models_dir)

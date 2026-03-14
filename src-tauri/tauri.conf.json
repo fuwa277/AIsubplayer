@@ -39,8 +39,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": [
-      "bin/aisubplayer-backend"
-    ]
+    "externalBin": [],
+    "resources": []
   }
 }

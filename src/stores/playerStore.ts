@@ -11,6 +11,7 @@ export interface PlayerState {
     playbackRate: number;
     isFastForwarding: boolean;
     progressMap: Record<string, number>;
+    isControlsVisible: boolean;
 
     setPlaying: (playing: boolean) => void;
     togglePlay: () => void;
@@ -22,6 +23,7 @@ export interface PlayerState {
     setFastForwarding: (ff: boolean) => void;
     saveProgress: (videoId: string, time: number) => void;
     getProgress: (videoId: string) => number;
+    setControlsVisible: (v: boolean) => void;
 }
 
 export const usePlayerStore = create<PlayerState>()(
@@ -36,6 +38,7 @@ export const usePlayerStore = create<PlayerState>()(
             playbackRate: 1,
             isFastForwarding: false,
             progressMap: {},
+            isControlsVisible: true,
 
             setPlaying: (playing) => set({ isPlaying: playing }),
             togglePlay: () => set((s) => ({ isPlaying: !s.isPlaying })),
@@ -56,6 +59,7 @@ export const usePlayerStore = create<PlayerState>()(
                 progressMap: { ...state.progressMap, [videoId]: time }
             })),
             getProgress: (videoId) => get().progressMap[videoId] || 0,
+            setControlsVisible: (v) => set({ isControlsVisible: v }),
         }),
         {
             name: 'aisubplayer-player',
